@@ -1,6 +1,7 @@
-"""Retrieval services package: embeddings and vector search integrations."""
+"""Retrieval services package: embeddings, rate limiting, and vector search integrations."""
 
 from app.services.retreival.embeddings import (
+    TokenBucketRateLimiter,
     aembed_query,
     aembed_text,
     aembed_texts,
@@ -8,6 +9,7 @@ from app.services.retreival.embeddings import (
     embed_text,
     embed_texts,
     get_genai_client,
+    get_rate_limiter,
     normalize_vector,
 )
 
@@ -19,5 +21,7 @@ __all__ = [
     "aembed_text",
     "aembed_query",
     "get_genai_client",
+    "get_rate_limiter",
+    "TokenBucketRateLimiter",
     "normalize_vector",
 ]

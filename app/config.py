@@ -9,6 +9,7 @@ class Settings:
      QDRANT_API_KEY =os.getenv("QDRANT_API_KEY")
      QDRANT_CLUSTER_ENDPOINT=os.getenv("QDRANT_CLUSTER_ENDPOINT")
      QDRANT_COLLECTION ="dyxi_rag"
+     EMBEDDING_RPM_LIMIT = int(os.getenv("EMBEDDING_RPM_LIMIT", "600"))
 
 
 settings = Settings()
