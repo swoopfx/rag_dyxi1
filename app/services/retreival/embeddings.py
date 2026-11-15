@@ -1,25 +1,41 @@
-"""Embeddings service using Google Gemini embedding models for vector database ingestion.
+"""Multimodal embeddings service using Google Gemini Embedding 2 and OpenAI multimodal fallback.
 
 Features:
-- Primary Google embedding model (e.g. 'gemini-embedding-001' or 'text-embedding-004').
-- Automatic batching with configurable batch size (up to Google's 100-item limit).
+- Primary Model: Google Gemini Embedding 2 ('gemini-embedding-2') with native
+  multimodal capabilities (text, images, and visual elements).
+- Fallback Model: OpenAI multimodal pipeline using 'text-embedding-3-small'
+  (with 'gpt-4o-mini' for visual feature extraction), guaranteeing identical
+  output dimensionality (e.g., 768) for vector database consistency.
+- Proactive & Reactive Rate Limiting:
+  * Thread-safe and async-safe Token Bucket rate limiter (configurable RPM).
+  * 429 / ResourceExhausted detection with 'retry-after' delay extraction.
+  * Shared throttling across concurrent worker threads to prevent cascading rate limits.
+  * Automatic failover to OpenAI fallback upon quota exhaustion or server errors.
+- Automatic batching with configurable batch size and concurrency control.
+- 1-to-1 vector generation: handles Gemini Embedding 2's aggregation behavior by
+  concurrently embedding individual chunks in parallel batches.
 - Dimension control via Matryoshka Representation Learning (MRL) (e.g. 768, 512, 256).
-- Low latency via concurrent parallel batch requests and client connection pooling.
-- Automatic retry with exponential backoff & jitter for transient errors.
-- Seamless fallback model mechanism (supporting secondary Google models or OpenAI 'text-embedding-3-small').
-- Synchronous and asynchronous embedding functions for ingestion and search.
+- Low latency via concurrent parallel requests and persistent client connection pooling.
+- Synchronous and asynchronous APIs for text, image, and multimodal inputs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import math
+import mimetypes
+from pathlib import Path
 import random
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from loguru import logger
+from PIL import Image
 
 from app.config import settings
 
@@ -46,14 +62,16 @@ except ImportError:
 # CONFIGURATION DEFAULTS
 # ==============================================================================
 
-DEFAULT_PRIMARY_MODEL: str = "gemini-embedding-001"
+DEFAULT_PRIMARY_MODEL: str = "gemini-embedding-2"
 DEFAULT_FALLBACK_MODEL: str = "text-embedding-3-small"
+DEFAULT_OPENAI_VISION_MODEL: str = "gpt-4o-mini"
 DEFAULT_DIMENSION: int = 768
-DEFAULT_BATCH_SIZE: int = 64
+DEFAULT_BATCH_SIZE: int = 32
 MAX_GOOGLE_BATCH_SIZE: int = 100
-DEFAULT_MAX_CONCURRENCY: int = 4
+DEFAULT_MAX_CONCURRENCY: int = 8
 DEFAULT_TIMEOUT_SECONDS: float = 30.0
 DEFAULT_MAX_RETRIES: int = 3
+DEFAULT_RPM_LIMIT: int = 600  # Requests per minute default (10 req/sec)
 DOCUMENT_TASK_TYPE: str = "RETRIEVAL_DOCUMENT"
 QUERY_TASK_TYPE: str = "RETRIEVAL_QUERY"
 
@@ -61,6 +79,95 @@ QUERY_TASK_TYPE: str = "RETRIEVAL_QUERY"
 _GENAI_CLIENT: Optional[Any] = None
 _OPENAI_CLIENT: Optional[Any] = None
 _ASYNC_OPENAI_CLIENT: Optional[Any] = None
+_RATE_LIMITERS: Dict[int, "TokenBucketRateLimiter"] = {}
+_RATE_LIMITER_LOCK = threading.Lock()
+
+# Supported image input types
+ImageInput = Union[Image.Image, bytes, bytearray, str, Path, Any]
+
+
+# ==============================================================================
+# TOKEN BUCKET RATE LIMITER (PROACTIVE RATE LIMITING)
+# ==============================================================================
+
+
+class TokenBucketRateLimiter:
+    """Thread-safe and async-safe Token Bucket Rate Limiter.
+
+    Proactively controls the request dispatch rate to stay within Google Gemini's
+    Requests-Per-Minute (RPM) limits and avoid 429 Too Many Requests errors.
+    """
+
+    def __init__(self, rpm: int = DEFAULT_RPM_LIMIT, burst_size: Optional[int] = None):
+        self.rpm = max(1, rpm)
+        self.rate = self.rpm / 60.0  # tokens added per second
+        self.capacity = burst_size or max(1, min(self.rpm, int(self.rpm / 6)))  # burst allowance
+        self.tokens = float(self.capacity)
+        self.last_update = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _replenish(self, now: float) -> None:
+        elapsed = now - self.last_update
+        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.rate)
+        self.last_update = now
+
+    def acquire(self, tokens: int = 1) -> None:
+        """Synchronously acquire tokens, sleeping if the bucket is empty."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._replenish(now)
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                needed = tokens - self.tokens
+                sleep_time = needed / self.rate
+            time.sleep(min(sleep_time, 1.0))
+
+    async def acquire_async(self, tokens: int = 1) -> None:
+        """Asynchronously acquire tokens without blocking the event loop."""
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                self._replenish(now)
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                needed = tokens - self.tokens
+                sleep_time = needed / self.rate
+            await asyncio.sleep(min(sleep_time, 1.0))
+
+    def throttle(self, penalty_seconds: float) -> None:
+        """Temporarily throttle the bucket when an external 429 response is encountered."""
+        with self._lock:
+            self.tokens = -penalty_seconds * self.rate
+            self.last_update = time.monotonic()
+
+
+def get_rate_limiter(rpm: Optional[int] = None) -> TokenBucketRateLimiter:
+    """Retrieve or create a cached TokenBucketRateLimiter for the given RPM."""
+    target_rpm = rpm or getattr(settings, "EMBEDDING_RPM_LIMIT", DEFAULT_RPM_LIMIT) or DEFAULT_RPM_LIMIT
+    with _RATE_LIMITER_LOCK:
+        if target_rpm not in _RATE_LIMITERS:
+            _RATE_LIMITERS[target_rpm] = TokenBucketRateLimiter(rpm=target_rpm)
+        return _RATE_LIMITERS[target_rpm]
+
+
+def _extract_retry_delay(exc: Exception, default_delay: float) -> float:
+    """Extract retry-after seconds from 429 error messages or headers if present."""
+    msg = str(exc).lower()
+    match = re.search(r"retry[- ]after[:\s]+([0-9.]+)", msg)
+    if not match:
+        match = re.search(r"seconds[:\s]+([0-9.]+)", msg)
+    if not match:
+        match = re.search(r"wait\s+([0-9.]+)\s*s", msg)
+
+    if match:
+        try:
+            return float(match.group(1)) + random.uniform(0.2, 0.8)
+        except (ValueError, TypeError):
+            pass
+    return default_delay
 
 
 # ==============================================================================
@@ -120,7 +227,7 @@ def get_async_openai_client(api_key: Optional[str] = None) -> Optional[Any]:
 
 
 # ==============================================================================
-# VECTOR NORMALIZATION & UTILITIES
+# VECTOR NORMALIZATION & IMAGE UTILITIES
 # ==============================================================================
 
 
@@ -132,7 +239,7 @@ def normalize_vector(vector: Sequence[float]) -> List[float]:
     return [x / norm for x in vector]
 
 
-def _chunk_list(lst: List[str], chunk_size: int) -> List[List[str]]:
+def _chunk_list(lst: List[Any], chunk_size: int) -> List[List[Any]]:
     """Partition a list into sublists of size at most chunk_size."""
     return [lst[i : i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
@@ -145,8 +252,41 @@ def _sanitize_text(text: str) -> str:
     return stripped if stripped else " "
 
 
+def _to_image_bytes(item: ImageInput) -> tuple[bytes, str]:
+    """Convert an image input (PIL Image, bytes, Path, Base64 data URI, ExtractedImage) to (bytes, mime_type)."""
+    # 1. ExtractedImage instance from load.py
+    if hasattr(item, "image") and getattr(item, "image") is not None:
+        img = item.image
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+
+    # 2. PIL Image.Image instance
+    if isinstance(item, Image.Image):
+        buf = io.BytesIO()
+        item.save(buf, format="PNG")
+        return buf.getvalue(), "image/png"
+
+    # 3. Raw bytes
+    if isinstance(item, (bytes, bytearray)):
+        return bytes(item), "image/png"
+
+    # 4. File path or Base64 data URI string
+    if isinstance(item, (str, Path)):
+        p = Path(item)
+        if p.exists() and p.is_file():
+            mime, _ = mimetypes.guess_type(p)
+            return p.read_bytes(), mime or "image/png"
+        elif isinstance(item, str) and item.startswith("data:image/"):
+            header, b64_data = item.split(",", 1)
+            mime = header.split(";")[0].replace("data:", "")
+            return base64.b64decode(b64_data), mime or "image/png"
+
+    raise ValueError(f"Unsupported image input type for embedding: {type(item)}")
+
+
 # ==============================================================================
-# SINGLE-BATCH EMBEDDING WITH RETRIES
+# SINGLE-BATCH TEXT EMBEDDING WITH RATE LIMITING
 # ==============================================================================
 
 
@@ -158,8 +298,15 @@ def _embed_google_batch_with_retry(
     task_type: Optional[str],
     max_retries: int,
     timeout: float,
+    rate_limiter: TokenBucketRateLimiter,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> List[List[float]]:
-    """Execute a single batch embedding against Google GenAI with exponential backoff."""
+    """Execute batch embedding against Google GenAI with proactive rate limiting & retry.
+
+    For Gemini Embedding 2 ('gemini-embedding-2'), passing multiple items generates
+    a single aggregated embedding. To generate distinct 1-to-1 embeddings for each chunk,
+    batch items are embedded individually with thread-pool concurrency and rate limiting.
+    """
     config_kwargs: dict[str, Any] = {
         "http_options": types.HttpOptions(timeout=int(timeout * 1000))
     }
@@ -169,13 +316,58 @@ def _embed_google_batch_with_retry(
         config_kwargs["task_type"] = task_type
 
     config = types.EmbedContentConfig(**config_kwargs)
+    is_gemini_2 = "gemini-embedding-2" in model.lower()
+
+    if is_gemini_2 and len(batch) > 1:
+        def _embed_single(text: str) -> List[float]:
+            last_err = None
+            for attempt in range(1, max_retries + 1):
+                rate_limiter.acquire(1)
+                try:
+                    res = client.models.embed_content(
+                        model=model,
+                        contents=text,
+                        config=config,
+                    )
+                    return list(res.embeddings[0].values)
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e).lower()
+                    if "404" in err_str or "not found" in err_str or "400" in err_str:
+                        raise e
+
+                    if attempt < max_retries:
+                        backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                        if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                            backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                            rate_limiter.throttle(backoff)
+                            logger.warning(
+                                f"Rate limit (429) hit for '{model}'. Throttling rate limiter and "
+                                f"retrying in {backoff:.2f}s (attempt {attempt}/{max_retries})..."
+                            )
+                        else:
+                            logger.warning(
+                                f"Google embedding attempt {attempt}/{max_retries} failed for '{model}': {e}. "
+                                f"Retrying in {backoff:.2f}s..."
+                            )
+                        time.sleep(backoff)
+                    else:
+                        raise e
+            raise last_err or RuntimeError("Single item embedding failed")
+
+        workers = min(max_concurrency, len(batch))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(_embed_single, batch))
+
+    contents_input = batch[0] if (is_gemini_2 and len(batch) == 1) else batch
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
+        rate_limiter.acquire(1)
         try:
             res = client.models.embed_content(
                 model=model,
-                contents=batch,
+                contents=contents_input,
                 config=config,
             )
             embeddings = [list(e.values) for e in res.embeddings]
@@ -184,18 +376,24 @@ def _embed_google_batch_with_retry(
         except (ClientError, APIError, Exception) as e:
             last_error = e
             err_str = str(e).lower()
-            # Non-retryable errors: 404 (model not found), 400 (bad request)
             if "404" in err_str or "not found" in err_str or "400" in err_str:
                 logger.warning(f"Google embedding model '{model}' non-retryable error: {e}")
                 raise e
 
-            # Retryable errors: 429 (rate limit), 503 (overloaded), timeout
             if attempt < max_retries:
-                backoff = (2 ** (attempt - 1)) + random.uniform(0.1, 0.5)
-                logger.warning(
-                    f"Google embedding attempt {attempt}/{max_retries} failed for model '{model}': {e}. "
-                    f"Retrying in {backoff:.2f}s..."
-                )
+                backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                    backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                    rate_limiter.throttle(backoff)
+                    logger.warning(
+                        f"Rate limit (429) hit on model '{model}'. Throttling and retrying in {backoff:.2f}s "
+                        f"(attempt {attempt}/{max_retries})..."
+                    )
+                else:
+                    logger.warning(
+                        f"Google embedding attempt {attempt}/{max_retries} failed for model '{model}': {e}. "
+                        f"Retrying in {backoff:.2f}s..."
+                    )
                 time.sleep(backoff)
             else:
                 logger.error(
@@ -214,8 +412,10 @@ async def _aembed_google_batch_with_retry(
     task_type: Optional[str],
     max_retries: int,
     timeout: float,
+    rate_limiter: TokenBucketRateLimiter,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> List[List[float]]:
-    """Execute a single batch embedding asynchronously with exponential backoff."""
+    """Execute batch embedding asynchronously with proactive rate limiting & retry."""
     config_kwargs: dict[str, Any] = {
         "http_options": types.HttpOptions(timeout=int(timeout * 1000))
     }
@@ -225,13 +425,54 @@ async def _aembed_google_batch_with_retry(
         config_kwargs["task_type"] = task_type
 
     config = types.EmbedContentConfig(**config_kwargs)
+    is_gemini_2 = "gemini-embedding-2" in model.lower()
+
+    if is_gemini_2 and len(batch) > 1:
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _aembed_single(text: str) -> List[float]:
+            async with sem:
+                last_err = None
+                for attempt in range(1, max_retries + 1):
+                    await rate_limiter.acquire_async(1)
+                    try:
+                        res = await client.aio.models.embed_content(
+                            model=model,
+                            contents=text,
+                            config=config,
+                        )
+                        return list(res.embeddings[0].values)
+                    except Exception as e:
+                        last_err = e
+                        err_str = str(e).lower()
+                        if "404" in err_str or "not found" in err_str or "400" in err_str:
+                            raise e
+
+                        if attempt < max_retries:
+                            backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                            if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                                backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                                rate_limiter.throttle(backoff)
+                                logger.warning(
+                                    f"Async rate limit (429) hit for '{model}'. Throttling and retrying in {backoff:.2f}s..."
+                                )
+                            await asyncio.sleep(backoff)
+                        else:
+                            raise e
+                raise last_err or RuntimeError("Single item async embedding failed")
+
+        tasks = [_aembed_single(t) for t in batch]
+        return await asyncio.gather(*tasks)
+
+    contents_input = batch[0] if (is_gemini_2 and len(batch) == 1) else batch
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
+        await rate_limiter.acquire_async(1)
         try:
             res = await client.aio.models.embed_content(
                 model=model,
-                contents=batch,
+                contents=contents_input,
                 config=config,
             )
             embeddings = [list(e.values) for e in res.embeddings]
@@ -245,11 +486,18 @@ async def _aembed_google_batch_with_retry(
                 raise e
 
             if attempt < max_retries:
-                backoff = (2 ** (attempt - 1)) + random.uniform(0.1, 0.5)
-                logger.warning(
-                    f"Async Google embedding attempt {attempt}/{max_retries} failed for '{model}': {e}. "
-                    f"Retrying in {backoff:.2f}s..."
-                )
+                backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                    backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                    rate_limiter.throttle(backoff)
+                    logger.warning(
+                        f"Async rate limit (429) hit on '{model}'. Throttling and retrying in {backoff:.2f}s..."
+                    )
+                else:
+                    logger.warning(
+                        f"Async Google embedding attempt {attempt}/{max_retries} failed for '{model}': {e}. "
+                        f"Retrying in {backoff:.2f}s..."
+                    )
                 await asyncio.sleep(backoff)
             else:
                 logger.error(
@@ -261,122 +509,145 @@ async def _aembed_google_batch_with_retry(
 
 
 # ==============================================================================
-# FALLBACK EMBEDDING DISPATCHER
+# OPENAI MULTIMODAL FALLBACK HANDLERS
 # ==============================================================================
 
 
-def _embed_fallback_batch(
+def _embed_openai_text_batch(
     batch: List[str],
     fallback_model: str,
     dimension: Optional[int],
-    task_type: Optional[str],
-    genai_client: genai.Client,
-    timeout: float,
 ) -> List[List[float]]:
-    """Execute embedding on the fallback model (secondary Google model or OpenAI)."""
-    logger.info(f"Invoking fallback embedding model: '{fallback_model}' for {len(batch)} items")
-
-    # Path A: Fallback to OpenAI (e.g. text-embedding-3-small)
-    if "text-embedding-3" in fallback_model or "openai" in fallback_model.lower():
-        openai_client = get_openai_client()
-        if openai_client is None:
-            raise RuntimeError(
-                f"OpenAI fallback model '{fallback_model}' was requested, but OPENAI_API_KEY is not configured."
-            )
-        kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
-        if dimension is not None:
-            kwargs["dimensions"] = dimension
-        resp = openai_client.embeddings.create(**kwargs)
-        return [item.embedding for item in resp.data]
-
-    # Path B: Fallback to another Google model (e.g. gemini-embedding-2)
-    if "gemini-embedding-2" in fallback_model:
-        # Note: gemini-embedding-2 aggregates multiple inputs in a single list,
-        # so embed items individually to guarantee 1-to-1 vectors.
-        config_kwargs: dict[str, Any] = {
-            "http_options": types.HttpOptions(timeout=int(timeout * 1000))
-        }
-        if dimension is not None:
-            config_kwargs["output_dimensionality"] = dimension
-        if task_type:
-            config_kwargs["task_type"] = task_type
-        config = types.EmbedContentConfig(**config_kwargs)
-
-        results: List[List[float]] = []
-        for text in batch:
-            res = genai_client.models.embed_content(
-                model=fallback_model, contents=text, config=config
-            )
-            results.append(list(res.embeddings[0].values))
-        return results
-
-    # Path C: Generic Google model fallback
-    return _embed_google_batch_with_retry(
-        client=genai_client,
-        batch=batch,
-        model=fallback_model,
-        dimension=dimension,
-        task_type=task_type,
-        max_retries=2,
-        timeout=timeout,
-    )
+    """Embed texts using OpenAI embedding model (default: text-embedding-3-small)."""
+    openai_client = get_openai_client()
+    if openai_client is None:
+        raise RuntimeError(
+            f"OpenAI fallback model '{fallback_model}' requested, but OPENAI_API_KEY is not configured."
+        )
+    kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
+    if dimension is not None:
+        kwargs["dimensions"] = dimension
+    resp = openai_client.embeddings.create(**kwargs)
+    return [item.embedding for item in resp.data]
 
 
-async def _aembed_fallback_batch(
+async def _aembed_openai_text_batch(
     batch: List[str],
     fallback_model: str,
     dimension: Optional[int],
-    task_type: Optional[str],
-    genai_client: genai.Client,
-    timeout: float,
 ) -> List[List[float]]:
-    """Execute async embedding on the fallback model."""
-    logger.info(f"Invoking async fallback embedding model: '{fallback_model}' for {len(batch)} items")
+    """Asynchronously embed texts using OpenAI embedding model."""
+    async_openai = get_async_openai_client()
+    if async_openai is None:
+        raise RuntimeError(
+            f"OpenAI fallback model '{fallback_model}' requested, but OPENAI_API_KEY is not configured."
+        )
+    kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
+    if dimension is not None:
+        kwargs["dimensions"] = dimension
+    resp = await async_openai.embeddings.create(**kwargs)
+    return [item.embedding for item in resp.data]
 
-    if "text-embedding-3" in fallback_model or "openai" in fallback_model.lower():
-        async_openai = get_async_openai_client()
-        if async_openai is None:
-            raise RuntimeError(
-                f"OpenAI fallback model '{fallback_model}' was requested, but OPENAI_API_KEY is not configured."
-            )
-        kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
-        if dimension is not None:
-            kwargs["dimensions"] = dimension
-        resp = await async_openai.embeddings.create(**kwargs)
-        return [item.embedding for item in resp.data]
 
-    if "gemini-embedding-2" in fallback_model:
-        config_kwargs: dict[str, Any] = {
-            "http_options": types.HttpOptions(timeout=int(timeout * 1000))
-        }
-        if dimension is not None:
-            config_kwargs["output_dimensionality"] = dimension
-        if task_type:
-            config_kwargs["task_type"] = task_type
-        config = types.EmbedContentConfig(**config_kwargs)
+def _embed_openai_image_fallback(
+    image: ImageInput,
+    fallback_model: str = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+) -> List[float]:
+    """Fallback handler for images using OpenAI multimodal vision model (gpt-4o-mini).
 
-        async def _embed_single(txt: str) -> List[float]:
-            res = await genai_client.aio.models.embed_content(
-                model=fallback_model, contents=txt, config=config
-            )
-            return list(res.embeddings[0].values)
+    Generates a semantic visual description using the vision model, and then embeds
+    the description into a 768-dimensional vector using text-embedding-3-small,
+    ensuring 100% schema alignment with Qdrant vector collections.
+    """
+    openai_client = get_openai_client()
+    if openai_client is None:
+        raise RuntimeError("OpenAI client is not configured for multimodal fallback.")
 
-        tasks = [_embed_single(text) for text in batch]
-        return await asyncio.gather(*tasks)
+    caption = getattr(image, "caption", None)
+    if caption and len(caption.strip()) > 10:
+        desc = f"Visual figure: {caption.strip()}"
+    else:
+        img_bytes, mime = _to_image_bytes(image)
+        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+        vision_resp = openai_client.chat.completions.create(
+            model=vision_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Provide a concise, detailed technical description of this figure/chart/diagram "
+                                "for semantic vector search indexing."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_str}"}},
+                    ],
+                }
+            ],
+            max_tokens=150,
+        )
+        desc = vision_resp.choices[0].message.content or "Figure visual representation"
 
-    return await _aembed_google_batch_with_retry(
-        client=genai_client,
-        batch=batch,
-        model=fallback_model,
+    embs = _embed_openai_text_batch(
+        batch=[desc],
+        fallback_model=fallback_model,
         dimension=dimension,
-        task_type=task_type,
-        max_retries=2,
-        timeout=timeout,
     )
+    return embs[0]
+
+
+async def _aembed_openai_image_fallback(
+    image: ImageInput,
+    fallback_model: str = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+) -> List[float]:
+    """Asynchronously embed an image using OpenAI multimodal vision fallback."""
+    async_openai = get_async_openai_client()
+    if async_openai is None:
+        raise RuntimeError("Async OpenAI client is not configured for multimodal fallback.")
+
+    caption = getattr(image, "caption", None)
+    if caption and len(caption.strip()) > 10:
+        desc = f"Visual figure: {caption.strip()}"
+    else:
+        img_bytes, mime = _to_image_bytes(image)
+        b64_str = base64.b64encode(img_bytes).decode("utf-8")
+        vision_resp = await async_openai.chat.completions.create(
+            model=vision_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Provide a concise, detailed technical description of this figure/chart/diagram "
+                                "for semantic vector search indexing."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_str}"}},
+                    ],
+                }
+            ],
+            max_tokens=150,
+        )
+        desc = vision_resp.choices[0].message.content or "Figure visual representation"
+
+    embs = await _aembed_openai_text_batch(
+        batch=[desc],
+        fallback_model=fallback_model,
+        dimension=dimension,
+    )
+    return embs[0]
 
 
 # ==============================================================================
-# MAIN EMBEDDING FUNCTIONS
+# MAIN TEXT EMBEDDING FUNCTIONS
 # ==============================================================================
 
 
@@ -388,28 +659,23 @@ def embed_texts(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_retries: int = DEFAULT_MAX_RETRIES,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[List[float]]:
-    """Embed texts using Google Gemini embedding model with batching, concurrency, and fallback.
-
-    Designed for embedding data to be stored in vector databases (e.g., Qdrant).
-    Features:
-    - Partitioning into batches respects the Google API 100-item batch limit.
-    - Concurrency reduces latency by running multiple batches in parallel threads.
-    - Output dimensionality (MRL) aligns vectors to the vector database collection size.
-    - Automatic fallback triggers if the primary Google model fails.
+    """Embed texts using Google Gemini Embedding 2 with rate limiting, batching, and OpenAI fallback.
 
     Args:
         texts: A single text string or a list of text strings/chunks to embed.
-        model: Primary Google embedding model (default: 'gemini-embedding-001').
+        model: Primary Google embedding model (default: 'gemini-embedding-2').
         dimension: Desired embedding vector dimension (default: 768).
-        batch_size: Number of texts per API request (max 100, default: 64).
-        max_concurrency: Number of concurrent batch worker threads (default: 4).
+        batch_size: Number of texts per batch slice (default: 32).
+        max_concurrency: Number of concurrent batch worker threads (default: 8).
         task_type: Retrieval task type (default: 'RETRIEVAL_DOCUMENT').
         fallback_model: Fallback model if primary model fails (default: 'text-embedding-3-small').
+        rpm_limit: Requests-per-minute throttle (default: 600 or from settings).
         timeout: Request timeout in seconds per batch (default: 30.0).
         max_retries: Max retry attempts per batch on transient errors (default: 3).
         normalize: Whether to L2-normalize vectors for cosine similarity (default: True).
@@ -426,20 +692,19 @@ def embed_texts(
     if not raw_list:
         return []
 
-    # Sanitize inputs
     sanitized_texts = [_sanitize_text(t) for t in raw_list]
     effective_batch_size = min(max(1, batch_size), MAX_GOOGLE_BATCH_SIZE)
 
     client = get_genai_client(api_key=api_key)
+    rate_limiter = get_rate_limiter(rpm=rpm_limit)
     batches = _chunk_list(sanitized_texts, effective_batch_size)
     num_batches = len(batches)
 
     logger.debug(
         f"Embedding {len(sanitized_texts)} texts into {num_batches} batches "
-        f"(batch_size={effective_batch_size}, dimension={dimension}, model='{model}')"
+        f"(batch_size={effective_batch_size}, dimension={dimension}, model='{model}', fallback='{fallback_model}')"
     )
 
-    # Worker function for a single batch with fallback support
     def _process_batch(batch_idx: int, batch_texts: List[str]) -> tuple[int, List[List[float]]]:
         try:
             embs = _embed_google_batch_with_retry(
@@ -450,22 +715,21 @@ def embed_texts(
                 task_type=task_type,
                 max_retries=max_retries,
                 timeout=timeout,
+                rate_limiter=rate_limiter,
+                max_concurrency=max_concurrency,
             )
             return batch_idx, embs
         except Exception as primary_exc:
             if fallback_model:
                 logger.warning(
                     f"Primary model '{model}' failed on batch {batch_idx + 1}/{num_batches}: {primary_exc}. "
-                    f"Failing over to fallback model '{fallback_model}'..."
+                    f"Failing over to OpenAI fallback model '{fallback_model}'..."
                 )
                 try:
-                    fallback_embs = _embed_fallback_batch(
+                    fallback_embs = _embed_openai_text_batch(
                         batch=batch_texts,
                         fallback_model=fallback_model,
                         dimension=dimension,
-                        task_type=task_type,
-                        genai_client=client,
-                        timeout=timeout,
                     )
                     return batch_idx, fallback_embs
                 except Exception as fallback_exc:
@@ -477,7 +741,6 @@ def embed_texts(
             else:
                 raise primary_exc
 
-    # Process batches: single batch runs directly; multiple batches run concurrently
     ordered_results: List[Optional[List[List[float]]]] = [None] * num_batches
 
     if num_batches == 1:
@@ -492,13 +755,11 @@ def embed_texts(
                 idx, embs = future.result()
                 ordered_results[idx] = embs
 
-    # Flatten ordered results
     flattened_embeddings: List[List[float]] = []
     for batch_embs in ordered_results:
         if batch_embs is not None:
             flattened_embeddings.extend(batch_embs)
 
-    # Optional L2 normalization for vector DB cosine indexing
     if normalize:
         flattened_embeddings = [normalize_vector(vec) for vec in flattened_embeddings]
 
@@ -511,10 +772,11 @@ def embed_text(
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Embed a single text string."""
+    """Embed a single text string using Google Gemini Embedding 2 with OpenAI fallback."""
     results = embed_texts(
         texts=[text],
         model=model,
@@ -523,6 +785,7 @@ def embed_text(
         max_concurrency=1,
         task_type=task_type,
         fallback_model=fallback_model,
+        rpm_limit=rpm_limit,
         normalize=normalize,
         api_key=api_key,
     )
@@ -534,19 +797,202 @@ def embed_query(
     model: str = DEFAULT_PRIMARY_MODEL,
     dimension: Optional[int] = DEFAULT_DIMENSION,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Embed a search query with task_type='RETRIEVAL_QUERY'."""
+    """Embed a search query using Google Gemini Embedding 2 with task_type='RETRIEVAL_QUERY'."""
     return embed_text(
         text=query,
         model=model,
         dimension=dimension,
         task_type=QUERY_TASK_TYPE,
         fallback_model=fallback_model,
+        rpm_limit=rpm_limit,
         normalize=normalize,
         api_key=api_key,
     )
+
+
+# ==============================================================================
+# MULTIMODAL & IMAGE EMBEDDING FUNCTIONS
+# ==============================================================================
+
+
+def embed_image(
+    image: ImageInput,
+    model: str = DEFAULT_PRIMARY_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+    task_type: str = DOCUMENT_TASK_TYPE,
+    fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    rpm_limit: Optional[int] = None,
+    normalize: bool = True,
+    api_key: Optional[str] = None,
+) -> List[float]:
+    """Embed an image using Google Gemini Embedding 2 with OpenAI multimodal fallback.
+
+    Accepts:
+    - PIL Image.Image instances
+    - Raw image bytes
+    - File path string or Path object
+    - Base64 data URI string
+    - ExtractedImage object (from app.ingestion.loader.load)
+
+    Args:
+        image: Target image representation.
+        model: Primary embedding model ('gemini-embedding-2').
+        dimension: Desired embedding dimension (default: 768).
+        task_type: Retrieval task type (default: 'RETRIEVAL_DOCUMENT').
+        fallback_model: OpenAI embedding fallback model ('text-embedding-3-small').
+        vision_model: OpenAI vision model for image descriptions ('gpt-4o-mini').
+        rpm_limit: Requests-per-minute throttle.
+        normalize: Whether to L2-normalize vectors (default: True).
+        api_key: Optional Gemini API key override.
+
+    Returns:
+        List[float]: 768-dimensional embedding vector representing the visual content.
+    """
+    client = get_genai_client(api_key=api_key)
+    rate_limiter = get_rate_limiter(rpm=rpm_limit)
+    rate_limiter.acquire(1)
+
+    img_bytes, mime = _to_image_bytes(image)
+
+    config_kwargs: dict[str, Any] = {
+        "http_options": types.HttpOptions(timeout=int(DEFAULT_TIMEOUT_SECONDS * 1000))
+    }
+    if dimension is not None:
+        config_kwargs["output_dimensionality"] = dimension
+    if task_type:
+        config_kwargs["task_type"] = task_type
+    config = types.EmbedContentConfig(**config_kwargs)
+
+    try:
+        res = client.models.embed_content(
+            model=model,
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+            config=config,
+        )
+        vec = list(res.embeddings[0].values)
+    except Exception as primary_exc:
+        logger.warning(
+            f"Primary image embedding with '{model}' failed: {primary_exc}. "
+            f"Failing over to OpenAI multimodal fallback ({vision_model} + {fallback_model})..."
+        )
+        try:
+            vec = _embed_openai_image_fallback(
+                image=image,
+                fallback_model=fallback_model,
+                vision_model=vision_model,
+                dimension=dimension,
+            )
+        except Exception as fallback_exc:
+            logger.error(f"OpenAI multimodal image fallback also failed: {fallback_exc}")
+            raise fallback_exc from primary_exc
+
+    return normalize_vector(vec) if normalize else vec
+
+
+def embed_images(
+    images: Sequence[ImageInput],
+    model: str = DEFAULT_PRIMARY_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    task_type: str = DOCUMENT_TASK_TYPE,
+    fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    rpm_limit: Optional[int] = None,
+    normalize: bool = True,
+    api_key: Optional[str] = None,
+) -> List[List[float]]:
+    """Concurrently embed a collection of images using Gemini Embedding 2 with OpenAI fallback."""
+    if not images:
+        return []
+
+    workers = min(max_concurrency, len(images))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                embed_image,
+                img,
+                model=model,
+                dimension=dimension,
+                task_type=task_type,
+                fallback_model=fallback_model,
+                vision_model=vision_model,
+                rpm_limit=rpm_limit,
+                normalize=normalize,
+                api_key=api_key,
+            )
+            for img in images
+        ]
+        return [f.result() for f in futures]
+
+
+def embed_multimodal(
+    items: Sequence[Union[str, ImageInput, Dict[str, Any]]],
+    model: str = DEFAULT_PRIMARY_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+    fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    normalize: bool = True,
+    api_key: Optional[str] = None,
+) -> List[List[float]]:
+    """Embed mixed collections of text strings, images, or paired multimodal dicts."""
+    results: List[List[float]] = []
+    for item in items:
+        if isinstance(item, str):
+            results.append(
+                embed_text(
+                    item,
+                    model=model,
+                    dimension=dimension,
+                    fallback_model=fallback_model,
+                    normalize=normalize,
+                    api_key=api_key,
+                )
+            )
+        elif isinstance(item, dict) and "image" in item:
+            # Paired text + image
+            pair_img = item["image"]
+            pair_text = item.get("text", "")
+            img_bytes, mime = _to_image_bytes(pair_img)
+            client = get_genai_client(api_key=api_key)
+            config = types.EmbedContentConfig(
+                task_type=DOCUMENT_TASK_TYPE,
+                output_dimensionality=dimension,
+            )
+            try:
+                res = client.models.embed_content(
+                    model=model,
+                    contents=[pair_text, types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+                    config=config,
+                )
+                vec = list(res.embeddings[0].values)
+            except Exception:
+                # Fallback via OpenAI
+                vec = _embed_openai_image_fallback(
+                    image=pair_img,
+                    fallback_model=fallback_model,
+                    vision_model=vision_model,
+                    dimension=dimension,
+                )
+            results.append(normalize_vector(vec) if normalize else vec)
+        else:
+            # Single image
+            results.append(
+                embed_image(
+                    item,
+                    model=model,
+                    dimension=dimension,
+                    fallback_model=fallback_model,
+                    vision_model=vision_model,
+                    normalize=normalize,
+                    api_key=api_key,
+                )
+            )
+    return results
 
 
 # ==============================================================================
@@ -562,15 +1008,13 @@ async def aembed_texts(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_retries: int = DEFAULT_MAX_RETRIES,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[List[float]]:
-    """Asynchronously embed texts with batching, concurrency limits, and fallback.
-
-    Ideal for FastAPI endpoints and async agent pipelines.
-    """
+    """Asynchronously embed texts with Google Gemini Embedding 2, rate limiting, and OpenAI fallback."""
     if isinstance(texts, str):
         raw_list = [texts]
     else:
@@ -583,6 +1027,7 @@ async def aembed_texts(
     effective_batch_size = min(max(1, batch_size), MAX_GOOGLE_BATCH_SIZE)
 
     client = get_genai_client(api_key=api_key)
+    rate_limiter = get_rate_limiter(rpm=rpm_limit)
     batches = _chunk_list(sanitized_texts, effective_batch_size)
     num_batches = len(batches)
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -598,22 +1043,21 @@ async def aembed_texts(
                     task_type=task_type,
                     max_retries=max_retries,
                     timeout=timeout,
+                    rate_limiter=rate_limiter,
+                    max_concurrency=max_concurrency,
                 )
                 return batch_idx, embs
             except Exception as primary_exc:
                 if fallback_model:
                     logger.warning(
                         f"Async primary model '{model}' failed on batch {batch_idx + 1}/{num_batches}: {primary_exc}. "
-                        f"Failing over to fallback '{fallback_model}'..."
+                        f"Failing over to OpenAI fallback '{fallback_model}'..."
                     )
                     try:
-                        fallback_embs = await _aembed_fallback_batch(
+                        fallback_embs = await _aembed_openai_text_batch(
                             batch=batch_texts,
                             fallback_model=fallback_model,
                             dimension=dimension,
-                            task_type=task_type,
-                            genai_client=client,
-                            timeout=timeout,
                         )
                         return batch_idx, fallback_embs
                     except Exception as fallback_exc:
@@ -627,7 +1071,6 @@ async def aembed_texts(
     tasks = [_process_batch(i, batch) for i, batch in enumerate(batches)]
     completed = await asyncio.gather(*tasks)
 
-    # Sort results to ensure exact input ordering
     completed_sorted = sorted(completed, key=lambda x: x[0])
     flattened_embeddings: List[List[float]] = []
     for _, batch_embs in completed_sorted:
@@ -645,10 +1088,11 @@ async def aembed_text(
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Asynchronously embed a single text string."""
+    """Asynchronously embed a single text string using Google Gemini Embedding 2 with OpenAI fallback."""
     results = await aembed_texts(
         texts=[text],
         model=model,
@@ -657,6 +1101,7 @@ async def aembed_text(
         max_concurrency=1,
         task_type=task_type,
         fallback_model=fallback_model,
+        rpm_limit=rpm_limit,
         normalize=normalize,
         api_key=api_key,
     )
@@ -668,16 +1113,71 @@ async def aembed_query(
     model: str = DEFAULT_PRIMARY_MODEL,
     dimension: Optional[int] = DEFAULT_DIMENSION,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Asynchronously embed a search query with task_type='RETRIEVAL_QUERY'."""
+    """Asynchronously embed a search query using Google Gemini Embedding 2 with task_type='RETRIEVAL_QUERY'."""
     return await aembed_text(
         text=query,
         model=model,
         dimension=dimension,
         task_type=QUERY_TASK_TYPE,
         fallback_model=fallback_model,
+        rpm_limit=rpm_limit,
         normalize=normalize,
         api_key=api_key,
     )
+
+
+async def aembed_image(
+    image: ImageInput,
+    model: str = DEFAULT_PRIMARY_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+    task_type: str = DOCUMENT_TASK_TYPE,
+    fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
+    rpm_limit: Optional[int] = None,
+    normalize: bool = True,
+    api_key: Optional[str] = None,
+) -> List[float]:
+    """Asynchronously embed an image using Google Gemini Embedding 2 with OpenAI multimodal fallback."""
+    client = get_genai_client(api_key=api_key)
+    rate_limiter = get_rate_limiter(rpm=rpm_limit)
+    await rate_limiter.acquire_async(1)
+
+    img_bytes, mime = _to_image_bytes(image)
+
+    config_kwargs: dict[str, Any] = {
+        "http_options": types.HttpOptions(timeout=int(DEFAULT_TIMEOUT_SECONDS * 1000))
+    }
+    if dimension is not None:
+        config_kwargs["output_dimensionality"] = dimension
+    if task_type:
+        config_kwargs["task_type"] = task_type
+    config = types.EmbedContentConfig(**config_kwargs)
+
+    try:
+        res = await client.aio.models.embed_content(
+            model=model,
+            contents=[types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+            config=config,
+        )
+        vec = list(res.embeddings[0].values)
+    except Exception as primary_exc:
+        logger.warning(
+            f"Async primary image embedding with '{model}' failed: {primary_exc}. "
+            f"Failing over to OpenAI multimodal fallback ({vision_model} + {fallback_model})..."
+        )
+        try:
+            vec = await _aembed_openai_image_fallback(
+                image=image,
+                fallback_model=fallback_model,
+                vision_model=vision_model,
+                dimension=dimension,
+            )
+        except Exception as fallback_exc:
+            logger.error(f"Async OpenAI multimodal fallback also failed: {fallback_exc}")
+            raise fallback_exc from primary_exc
+
+    return normalize_vector(vec) if normalize else vec
