@@ -1,6 +1,157 @@
-# Environments
+# ==============================================================================
+# SECRETS, CREDENTIALS & SENSITIVE KEYS
+# ==============================================================================
 .env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+credentials.json
+secrets.json
+service-account*.json
+client_secret*.json
+id_rsa*
+id_ed25519*
+
+# ==============================================================================
+# BYTE-COMPILED / OPTIMIZED / PYTHON ARTIFACTS
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# C extensions & build distribution
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==============================================================================
+# VIRTUAL ENVIRONMENTS
+# ==============================================================================
+.venv/
 .venv
-env/
 venv/
+env/
 ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# TESTING, COVERAGE & CODE QUALITY
+# ==============================================================================
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+htmlcov/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ==============================================================================
+# JUPYTER NOTEBOOKS
+# ==============================================================================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ==============================================================================
+# VECTOR DATABASE & LOCAL PERSISTENCE STORAGE
+# ==============================================================================
+qdrant_storage/
+vector_db/
+storage/
+data/
+chroma/
+*.sqlite
+*.sqlite3
+*.db
+
+# ==============================================================================
+# MODEL WEIGHTS, EMBEDDINGS & CACHES
+# ==============================================================================
+.cache/
+models/
+weights/
+checkpoints/
+*.onnx
+*.safetensors
+*.bin
+*.pt
+*.pth
+.huggingface/
+
+# ==============================================================================
+# LOGS & OBSERVABILITY ARTIFACTS
+# ==============================================================================
+*.log
+logs/
+pip-log.txt
+pip-delete-this-directory.txt
+.logfire/
+.langsmith/
+
+# ==============================================================================
+# DOCUMENT INGESTION & TEMPORARY ARTIFACTS
+# ==============================================================================
+extracted_figures/
+extracted_images/
+temp/
+tmp/
+
+# ==============================================================================
+# IDEs, EDITORS & WORKSPACES
+# ==============================================================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ==============================================================================
+# OPERATING SYSTEM SPECIFIC FILES
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
