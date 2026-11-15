@@ -1,6 +1,8 @@
 """Retrieval services package: multimodal embeddings, rate limiting, and vector search integrations."""
 
 from app.services.retreival.embeddings import (
+    DEFAULT_FALLBACK_MODEL,
+    DEFAULT_PRIMARY_MODEL,
     TokenBucketRateLimiter,
     aembed_image,
     aembed_query,
@@ -13,12 +15,15 @@ from app.services.retreival.embeddings import (
     embed_text,
     embed_texts,
     get_genai_client,
+    get_jina_client,
     get_openai_client,
     get_rate_limiter,
     normalize_vector,
 )
 
 __all__ = [
+    "DEFAULT_PRIMARY_MODEL",
+    "DEFAULT_FALLBACK_MODEL",
     "embed_texts",
     "embed_text",
     "embed_query",
@@ -30,6 +35,7 @@ __all__ = [
     "aembed_query",
     "aembed_image",
     "get_genai_client",
+    "get_jina_client",
     "get_openai_client",
     "get_rate_limiter",
     "TokenBucketRateLimiter",
