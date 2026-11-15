@@ -7,13 +7,11 @@ Features:
   with native image and text embeddings and Matryoshka Representation Learning (MRL)
   dimension truncation (default: 768), guaranteeing identical output dimensionality
   for vector database consistency.
-- Tertiary Fallback: OpenAI multimodal pipeline ('text-embedding-3-small' + 'gpt-4o-mini')
-  when OpenAI credentials are configured and Jina is unavailable.
 - Proactive & Reactive Rate Limiting:
   * Thread-safe and async-safe Token Bucket rate limiter (configurable RPM).
   * 429 / ResourceExhausted detection with 'retry-after' delay extraction.
   * Shared throttling across concurrent worker threads to prevent cascading rate limits.
-  * Automatic multi-tier failover upon quota exhaustion or server errors.
+  * Automatic failover to Jina Embeddings v4 upon quota exhaustion or server errors.
 - Automatic batching with configurable batch size and concurrency control.
 - 1-to-1 vector generation: handles Gemini Embedding 2's aggregation behavior by
   concurrently embedding individual chunks in parallel batches.
@@ -60,13 +58,6 @@ except ImportError:
     APIError = Exception  # type: ignore
     ClientError = Exception  # type: ignore
 
-# OpenAI fallback import
-try:
-    from openai import AsyncOpenAI, OpenAI
-except ImportError:
-    OpenAI = None  # type: ignore
-    AsyncOpenAI = None  # type: ignore
-
 
 # ==============================================================================
 # CONFIGURATION DEFAULTS
@@ -74,8 +65,6 @@ except ImportError:
 
 DEFAULT_PRIMARY_MODEL: str = "gemini-embedding-2"
 DEFAULT_FALLBACK_MODEL: str = "jina-embeddings-v4"
-DEFAULT_OPENAI_FALLBACK_MODEL: str = "text-embedding-3-small"
-DEFAULT_OPENAI_VISION_MODEL: str = "gpt-4o-mini"
 JINA_API_URL: str = "https://api.jina.ai/v1/embeddings"
 DEFAULT_DIMENSION: int = 768
 DEFAULT_BATCH_SIZE: int = 32
@@ -89,8 +78,6 @@ QUERY_TASK_TYPE: str = "RETRIEVAL_QUERY"
 
 # Reusable client caches for latency optimization (connection pooling)
 _GENAI_CLIENT: Optional[Any] = None
-_OPENAI_CLIENT: Optional[Any] = None
-_ASYNC_OPENAI_CLIENT: Optional[Any] = None
 _JINA_CLIENT: Optional[Any] = None
 _ASYNC_JINA_CLIENT: Optional[Any] = None
 _RATE_LIMITERS: Dict[int, "TokenBucketRateLimiter"] = {}
@@ -204,40 +191,6 @@ def get_genai_client(api_key: Optional[str] = None) -> genai.Client:
             _GENAI_CLIENT = client
         return client
     return _GENAI_CLIENT
-
-
-def get_openai_client(api_key: Optional[str] = None) -> Optional[Any]:
-    """Get or initialize a cached OpenAI client for fallback embeddings."""
-    global _OPENAI_CLIENT
-    if OpenAI is None:
-        return None
-    key = api_key or settings.OPENAI_API_KEY
-    if not key:
-        return None
-
-    if _OPENAI_CLIENT is None or api_key is not None:
-        client = OpenAI(api_key=key)
-        if api_key is None:
-            _OPENAI_CLIENT = client
-        return client
-    return _OPENAI_CLIENT
-
-
-def get_async_openai_client(api_key: Optional[str] = None) -> Optional[Any]:
-    """Get or initialize a cached AsyncOpenAI client for fallback embeddings."""
-    global _ASYNC_OPENAI_CLIENT
-    if AsyncOpenAI is None:
-        return None
-    key = api_key or settings.OPENAI_API_KEY
-    if not key:
-        return None
-
-    if _ASYNC_OPENAI_CLIENT is None or api_key is not None:
-        client = AsyncOpenAI(api_key=key)
-        if api_key is None:
-            _ASYNC_OPENAI_CLIENT = client
-        return client
-    return _ASYNC_OPENAI_CLIENT
 
 
 def _get_jina_api_key(api_key: Optional[str] = None) -> Optional[str]:
@@ -751,309 +704,88 @@ async def _aembed_jina_batch(
 
 
 # ==============================================================================
-# OPENAI MULTIMODAL FALLBACK HANDLERS (TERTIARY FALLBACK)
-# ==============================================================================
-
-
-def _embed_openai_text_batch(
-    batch: List[str],
-    fallback_model: str = DEFAULT_OPENAI_FALLBACK_MODEL,
-    dimension: Optional[int] = DEFAULT_DIMENSION,
-) -> List[List[float]]:
-    """Embed texts using OpenAI embedding model (default: text-embedding-3-small)."""
-    openai_client = get_openai_client()
-    if openai_client is None:
-        raise RuntimeError(
-            f"OpenAI fallback model '{fallback_model}' requested, but OPENAI_API_KEY is not configured."
-        )
-    kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
-    if dimension is not None:
-        kwargs["dimensions"] = dimension
-    resp = openai_client.embeddings.create(**kwargs)
-    return [item.embedding for item in resp.data]
-
-
-async def _aembed_openai_text_batch(
-    batch: List[str],
-    fallback_model: str = DEFAULT_OPENAI_FALLBACK_MODEL,
-    dimension: Optional[int] = DEFAULT_DIMENSION,
-) -> List[List[float]]:
-    """Asynchronously embed texts using OpenAI embedding model."""
-    async_openai = get_async_openai_client()
-    if async_openai is None:
-        raise RuntimeError(
-            f"OpenAI fallback model '{fallback_model}' requested, but OPENAI_API_KEY is not configured."
-        )
-    kwargs: dict[str, Any] = {"model": fallback_model, "input": batch}
-    if dimension is not None:
-        kwargs["dimensions"] = dimension
-    resp = await async_openai.embeddings.create(**kwargs)
-    return [item.embedding for item in resp.data]
-
-
-def _embed_openai_image_fallback(
-    image: ImageInput,
-    fallback_model: str = DEFAULT_OPENAI_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
-    dimension: Optional[int] = DEFAULT_DIMENSION,
-) -> List[float]:
-    """Fallback handler for images using OpenAI multimodal vision model (gpt-4o-mini).
-
-    Generates a semantic visual description using the vision model, and then embeds
-    the description into a 768-dimensional vector using text-embedding-3-small,
-    ensuring 100% schema alignment with Qdrant vector collections.
-    """
-    openai_client = get_openai_client()
-    if openai_client is None:
-        raise RuntimeError("OpenAI client is not configured for multimodal fallback.")
-
-    caption = getattr(image, "caption", None)
-    if caption and len(caption.strip()) > 10:
-        desc = f"Visual figure: {caption.strip()}"
-    else:
-        img_bytes, mime = _to_image_bytes(image)
-        b64_str = base64.b64encode(img_bytes).decode("utf-8")
-        vision_resp = openai_client.chat.completions.create(
-            model=vision_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Provide a concise, detailed technical description of this figure/chart/diagram "
-                                "for semantic vector search indexing."
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_str}"}},
-                    ],
-                }
-            ],
-            max_tokens=150,
-        )
-        desc = vision_resp.choices[0].message.content or "Figure visual representation"
-
-    embs = _embed_openai_text_batch(
-        batch=[desc],
-        fallback_model=fallback_model,
-        dimension=dimension,
-    )
-    return embs[0]
-
-
-async def _aembed_openai_image_fallback(
-    image: ImageInput,
-    fallback_model: str = DEFAULT_OPENAI_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
-    dimension: Optional[int] = DEFAULT_DIMENSION,
-) -> List[float]:
-    """Asynchronously embed an image using OpenAI multimodal vision fallback."""
-    async_openai = get_async_openai_client()
-    if async_openai is None:
-        raise RuntimeError("Async OpenAI client is not configured for multimodal fallback.")
-
-    caption = getattr(image, "caption", None)
-    if caption and len(caption.strip()) > 10:
-        desc = f"Visual figure: {caption.strip()}"
-    else:
-        img_bytes, mime = _to_image_bytes(image)
-        b64_str = base64.b64encode(img_bytes).decode("utf-8")
-        vision_resp = await async_openai.chat.completions.create(
-            model=vision_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Provide a concise, detailed technical description of this figure/chart/diagram "
-                                "for semantic vector search indexing."
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64_str}"}},
-                    ],
-                }
-            ],
-            max_tokens=150,
-        )
-        desc = vision_resp.choices[0].message.content or "Figure visual representation"
-
-    embs = await _aembed_openai_text_batch(
-        batch=[desc],
-        fallback_model=fallback_model,
-        dimension=dimension,
-    )
-    return embs[0]
-
-
-# ==============================================================================
-# UNIFIED FALLBACK ROUTERS (JINA V4 -> OPENAI CASCADING)
+# FALLBACK EMBEDDING ROUTERS (JINA EMBEDDINGS V4)
 # ==============================================================================
 
 
 def _embed_fallback_batch(
     batch: List[str],
-    fallback_model: str,
-    dimension: Optional[int],
+    fallback_model: str = DEFAULT_FALLBACK_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: Optional[str] = DOCUMENT_TASK_TYPE,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     api_key: Optional[str] = None,
 ) -> List[List[float]]:
-    """Route batch embedding to fallback models (Jina AI primary, OpenAI secondary)."""
-    if "jina" in fallback_model.lower():
-        try:
-            return _embed_jina_batch(
-                inputs=batch,
-                model=fallback_model,
-                dimension=dimension,
-                task_type=task_type,
-                timeout=timeout,
-                api_key=api_key,
-            )
-        except Exception as jina_err:
-            if get_openai_client() is not None:
-                logger.warning(
-                    f"Jina fallback '{fallback_model}' failed ({jina_err}). "
-                    f"Cascading to OpenAI tertiary fallback '{DEFAULT_OPENAI_FALLBACK_MODEL}'..."
-                )
-                return _embed_openai_text_batch(
-                    batch=batch,
-                    fallback_model=DEFAULT_OPENAI_FALLBACK_MODEL,
-                    dimension=dimension,
-                )
-            raise jina_err
-
-    # Explicit OpenAI or other fallback model
-    return _embed_openai_text_batch(
-        batch=batch,
-        fallback_model=fallback_model,
+    """Route batch text embedding to the fallback model (jina-embeddings-v4)."""
+    return _embed_jina_batch(
+        inputs=batch,
+        model=fallback_model,
         dimension=dimension,
+        task_type=task_type,
+        timeout=timeout,
+        max_retries=max_retries,
+        api_key=api_key,
     )
 
 
 async def _aembed_fallback_batch(
     batch: List[str],
-    fallback_model: str,
-    dimension: Optional[int],
+    fallback_model: str = DEFAULT_FALLBACK_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: Optional[str] = DOCUMENT_TASK_TYPE,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     api_key: Optional[str] = None,
 ) -> List[List[float]]:
-    """Asynchronously route batch embedding to fallback models."""
-    if "jina" in fallback_model.lower():
-        try:
-            return await _aembed_jina_batch(
-                inputs=batch,
-                model=fallback_model,
-                dimension=dimension,
-                task_type=task_type,
-                timeout=timeout,
-                api_key=api_key,
-            )
-        except Exception as jina_err:
-            if get_async_openai_client() is not None:
-                logger.warning(
-                    f"Async Jina fallback '{fallback_model}' failed ({jina_err}). "
-                    f"Cascading to OpenAI tertiary fallback '{DEFAULT_OPENAI_FALLBACK_MODEL}'..."
-                )
-                return await _aembed_openai_text_batch(
-                    batch=batch,
-                    fallback_model=DEFAULT_OPENAI_FALLBACK_MODEL,
-                    dimension=dimension,
-                )
-            raise jina_err
-
-    return await _aembed_openai_text_batch(
-        batch=batch,
-        fallback_model=fallback_model,
+    """Asynchronously route batch text embedding to the fallback model (jina-embeddings-v4)."""
+    return await _aembed_jina_batch(
+        inputs=batch,
+        model=fallback_model,
         dimension=dimension,
+        task_type=task_type,
+        timeout=timeout,
+        max_retries=max_retries,
+        api_key=api_key,
     )
 
 
 def _embed_image_fallback(
     image: ImageInput,
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: Optional[str] = DOCUMENT_TASK_TYPE,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Route image embedding to fallback models (Jina native image or OpenAI vision)."""
-    if "jina" in fallback_model.lower():
-        try:
-            data_uri = _to_image_data_uri(image)
-            embs = _embed_jina_batch(
-                inputs=[{"image": data_uri}],
-                model=fallback_model,
-                dimension=dimension,
-                task_type=task_type,
-                api_key=api_key,
-            )
-            return embs[0]
-        except Exception as jina_err:
-            if get_openai_client() is not None:
-                logger.warning(
-                    f"Jina image fallback '{fallback_model}' failed ({jina_err}). "
-                    f"Cascading to OpenAI vision tertiary fallback ({vision_model} + {DEFAULT_OPENAI_FALLBACK_MODEL})..."
-                )
-                return _embed_openai_image_fallback(
-                    image=image,
-                    fallback_model=DEFAULT_OPENAI_FALLBACK_MODEL,
-                    vision_model=vision_model,
-                    dimension=dimension,
-                )
-            raise jina_err
-
-    return _embed_openai_image_fallback(
-        image=image,
-        fallback_model=fallback_model,
-        vision_model=vision_model,
+    """Route image embedding to the fallback model (jina-embeddings-v4) using native image input."""
+    data_uri = _to_image_data_uri(image)
+    embs = _embed_jina_batch(
+        inputs=[{"image": data_uri}],
+        model=fallback_model,
         dimension=dimension,
+        task_type=task_type,
+        api_key=api_key,
     )
+    return embs[0]
 
 
 async def _aembed_image_fallback(
     image: ImageInput,
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: Optional[str] = DOCUMENT_TASK_TYPE,
     api_key: Optional[str] = None,
 ) -> List[float]:
-    """Asynchronously route image embedding to fallback models."""
-    if "jina" in fallback_model.lower():
-        try:
-            data_uri = _to_image_data_uri(image)
-            embs = await _aembed_jina_batch(
-                inputs=[{"image": data_uri}],
-                model=fallback_model,
-                dimension=dimension,
-                task_type=task_type,
-                api_key=api_key,
-            )
-            return embs[0]
-        except Exception as jina_err:
-            if get_async_openai_client() is not None:
-                logger.warning(
-                    f"Async Jina image fallback '{fallback_model}' failed ({jina_err}). "
-                    f"Cascading to OpenAI vision tertiary fallback ({vision_model} + {DEFAULT_OPENAI_FALLBACK_MODEL})..."
-                )
-                return await _aembed_openai_image_fallback(
-                    image=image,
-                    fallback_model=DEFAULT_OPENAI_FALLBACK_MODEL,
-                    vision_model=vision_model,
-                    dimension=dimension,
-                )
-            raise jina_err
-
-    return await _aembed_openai_image_fallback(
-        image=image,
-        fallback_model=fallback_model,
-        vision_model=vision_model,
+    """Asynchronously route image embedding to the fallback model (jina-embeddings-v4) using native image input."""
+    data_uri = _to_image_data_uri(image)
+    embs = await _aembed_jina_batch(
+        inputs=[{"image": data_uri}],
+        model=fallback_model,
         dimension=dimension,
+        task_type=task_type,
+        api_key=api_key,
     )
+    return embs[0]
 
 
 # ==============================================================================
@@ -1238,7 +970,6 @@ def embed_image(
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
@@ -1258,7 +989,6 @@ def embed_image(
         dimension: Desired embedding dimension (default: 768).
         task_type: Retrieval task type (default: 'RETRIEVAL_DOCUMENT').
         fallback_model: Fallback model ('jina-embeddings-v4').
-        vision_model: OpenAI vision model for secondary fallback ('gpt-4o-mini').
         rpm_limit: Requests-per-minute throttle.
         normalize: Whether to L2-normalize vectors (default: True).
         api_key: Optional Gemini API key override.
@@ -1297,7 +1027,6 @@ def embed_image(
             vec = _embed_image_fallback(
                 image=image,
                 fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
-                vision_model=vision_model,
                 dimension=dimension,
                 task_type=task_type,
                 api_key=api_key,
@@ -1316,7 +1045,6 @@ def embed_images(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
@@ -1335,7 +1063,6 @@ def embed_images(
                 dimension=dimension,
                 task_type=task_type,
                 fallback_model=fallback_model,
-                vision_model=vision_model,
                 rpm_limit=rpm_limit,
                 normalize=normalize,
                 api_key=api_key,
@@ -1350,7 +1077,6 @@ def embed_multimodal(
     model: str = DEFAULT_PRIMARY_MODEL,
     dimension: Optional[int] = DEFAULT_DIMENSION,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     normalize: bool = True,
     api_key: Optional[str] = None,
 ) -> List[List[float]]:
@@ -1390,7 +1116,6 @@ def embed_multimodal(
                 vec = _embed_image_fallback(
                     image=pair_img,
                     fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
-                    vision_model=vision_model,
                     dimension=dimension,
                     task_type=DOCUMENT_TASK_TYPE,
                     api_key=api_key,
@@ -1404,7 +1129,6 @@ def embed_multimodal(
                     model=model,
                     dimension=dimension,
                     fallback_model=fallback_model,
-                    vision_model=vision_model,
                     normalize=normalize,
                     api_key=api_key,
                 )
@@ -1556,7 +1280,6 @@ async def aembed_image(
     dimension: Optional[int] = DEFAULT_DIMENSION,
     task_type: str = DOCUMENT_TASK_TYPE,
     fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
-    vision_model: str = DEFAULT_OPENAI_VISION_MODEL,
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
@@ -1593,7 +1316,6 @@ async def aembed_image(
             vec = await _aembed_image_fallback(
                 image=image,
                 fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
-                vision_model=vision_model,
                 dimension=dimension,
                 task_type=task_type,
                 api_key=api_key,

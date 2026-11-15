@@ -16,7 +16,6 @@ from app.services.retreival.embeddings import (
     embed_texts,
     get_genai_client,
     get_jina_client,
-    get_openai_client,
     get_rate_limiter,
     normalize_vector,
 )
@@ -36,7 +35,6 @@ __all__ = [
     "aembed_image",
     "get_genai_client",
     "get_jina_client",
-    "get_openai_client",
     "get_rate_limiter",
     "TokenBucketRateLimiter",
     "normalize_vector",
