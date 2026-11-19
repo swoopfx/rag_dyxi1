@@ -11,6 +11,7 @@ class Settings:
      QDRANT_CLUSTER_ENDPOINT=os.getenv("QDRANT_CLUSTER_ENDPOINT")
      QDRANT_COLLECTION ="dyxi_rag"
      EMBEDDING_RPM_LIMIT = int(os.getenv("EMBEDDING_RPM_LIMIT", "600"))
+     LOGFIRE_TOKEN = os.getenv("LOGFIRE_TOKEN")
 
 
 settings = Settings()
