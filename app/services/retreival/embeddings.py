@@ -40,13 +40,20 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 from loguru import logger
 from PIL import Image
 
+try:
+    from langchain_core.embeddings import Embeddings
+except ImportError:
+    class Embeddings:  # type: ignore
+        pass
+
 from app.config import settings
 
 # Logfire Observability Setup
 try:
     import logfire
 
-    _logfire_token = getattr(settings, "LOGFIRE_TOKEN", None) or os.getenv("LOGFIRE_TOKEN")
+    _logfire_token = getattr(settings, "LOGFIRE_TOKEN",
+                             None) or os.getenv("LOGFIRE_TOKEN")
     logfire.configure(
         send_to_logfire="if-token-present",
         token=_logfire_token,
@@ -95,6 +102,7 @@ def _logfire_span(name: str, **kwargs: Any):
             yield span
     else:
         yield _NOOP_SPAN
+
 
 # HTTP client for Jina AI API
 try:
@@ -183,7 +191,8 @@ class TokenBucketRateLimiter:
         self.rpm = max(1, rpm)
         self.rate = self.rpm / 60.0  # tokens added per second
         # Burst capacity absorbs concurrent worker dispatch (~10s quota allowance) without tripping RPM
-        self.capacity = burst_size or max(1, min(self.rpm, int(self.rpm / 6)))  # burst allowance
+        self.capacity = burst_size or max(
+            1, min(self.rpm, int(self.rpm / 6)))  # burst allowance
         self.tokens = float(self.capacity)
         self.last_update = time.monotonic()
         self._lock = threading.Lock()
@@ -201,7 +210,8 @@ class TokenBucketRateLimiter:
         """
         # Lazy replenishment: compute accrued tokens from elapsed time instead of background polling
         elapsed = now - self.last_update
-        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.rate)
+        self.tokens = min(float(self.capacity),
+                          self.tokens + elapsed * self.rate)
         self.last_update = now
 
     def acquire(self, tokens: int = 1) -> None:
@@ -304,7 +314,8 @@ def get_rate_limiter(rpm: Optional[int] = None) -> TokenBucketRateLimiter:
         Instantiating multiple independent limiters would split quota tracking and allow
         threads to overwhelm the API. A centralized singleton per RPM ensures unified pacing.
     """
-    target_rpm = rpm or getattr(settings, "EMBEDDING_RPM_LIMIT", DEFAULT_RPM_LIMIT) or DEFAULT_RPM_LIMIT
+    target_rpm = rpm or getattr(
+        settings, "EMBEDDING_RPM_LIMIT", DEFAULT_RPM_LIMIT) or DEFAULT_RPM_LIMIT
     with _RATE_LIMITER_LOCK:
         if target_rpm not in _RATE_LIMITERS:
             _RATE_LIMITERS[target_rpm] = TokenBucketRateLimiter(rpm=target_rpm)
@@ -480,7 +491,7 @@ def _chunk_list(lst: List[Any], chunk_size: int) -> List[List[Any]]:
         limit of 100 texts per call). Chunking prevents payload rejections while creating
         manageable work units that can be dispatched across parallel worker threads.
     """
-    return [lst[i : i + chunk_size] for i in range(0, len(lst), chunk_size)]
+    return [lst[i: i + chunk_size] for i in range(0, len(lst), chunk_size)]
 
 
 def _sanitize_text(text: str) -> str:
@@ -547,7 +558,8 @@ def _to_image_bytes(item: ImageInput) -> tuple[bytes, str]:
             mime = header.split(";")[0].replace("data:", "")
             return base64.b64decode(b64_data), mime or "image/png"
 
-    raise ValueError(f"Unsupported image input type for embedding: {type(item)}")
+    raise ValueError(
+        f"Unsupported image input type for embedding: {type(item)}")
 
 
 def _to_image_data_uri(item: ImageInput) -> str:
@@ -657,7 +669,8 @@ def _embed_google_batch_with_retry(
             def _embed_single(text: str) -> List[float]:
                 last_err = None
                 for attempt in range(1, max_retries + 1):
-                    rate_limiter.acquire(1)  # Throttle against shared token bucket
+                    # Throttle against shared token bucket
+                    rate_limiter.acquire(1)
                     try:
                         res = client.models.embed_content(
                             model=model,
@@ -673,10 +686,12 @@ def _embed_google_batch_with_retry(
                             raise e
 
                         if attempt < max_retries:
-                            backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                            backoff = (2 ** (attempt - 1)) + \
+                                random.uniform(0.2, 0.6)
                             # Reactive 429 backoff: pause the shared limiter to hold other threads
                             if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
-                                backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                                backoff = _extract_retry_delay(
+                                    e, default_delay=backoff * 2.0)
                                 rate_limiter.throttle(backoff)
                                 logger.warning(
                                     f"Rate limit (429) hit for '{model}'. Throttling rate limiter and "
@@ -697,7 +712,8 @@ def _embed_google_batch_with_retry(
                 return list(executor.map(_embed_single, batch))
 
         # Single item for Gemini 2, or standard list batching for legacy models (e.g. text-embedding-004)
-        contents_input = batch[0] if (is_gemini_2 and len(batch) == 1) else batch
+        contents_input = batch[0] if (
+            is_gemini_2 and len(batch) == 1) else batch
 
         last_error: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
@@ -715,13 +731,15 @@ def _embed_google_batch_with_retry(
                 last_error = e
                 err_str = str(e).lower()
                 if "404" in err_str or "not found" in err_str or "400" in err_str:
-                    logger.warning(f"Google embedding model '{model}' non-retryable error: {e}")
+                    logger.warning(
+                        f"Google embedding model '{model}' non-retryable error: {e}")
                     raise e
 
                 if attempt < max_retries:
                     backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
                     if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
-                        backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                        backoff = _extract_retry_delay(
+                            e, default_delay=backoff * 2.0)
                         rate_limiter.throttle(backoff)
                         logger.warning(
                             f"Rate limit (429) hit on model '{model}'. Throttling and retrying in {backoff:.2f}s "
@@ -787,7 +805,8 @@ async def _aembed_google_batch_with_retry(
     ):
         # In Gemini Embedding 2, embed individual items asynchronously to avoid vector aggregation
         if is_gemini_2 and len(batch) > 1:
-            sem = asyncio.Semaphore(max_concurrency)  # Limit concurrent async tasks to bounded concurrency
+            # Limit concurrent async tasks to bounded concurrency
+            sem = asyncio.Semaphore(max_concurrency)
 
             async def _aembed_single(text: str) -> List[float]:
                 async with sem:
@@ -808,9 +827,11 @@ async def _aembed_google_batch_with_retry(
                                 raise e
 
                             if attempt < max_retries:
-                                backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
+                                backoff = (2 ** (attempt - 1)) + \
+                                    random.uniform(0.2, 0.6)
                                 if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
-                                    backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                                    backoff = _extract_retry_delay(
+                                        e, default_delay=backoff * 2.0)
                                     rate_limiter.throttle(backoff)
                                     logger.warning(
                                         f"Async rate limit (429) hit for '{model}'. Throttling and retrying in {backoff:.2f}s..."
@@ -818,13 +839,15 @@ async def _aembed_google_batch_with_retry(
                                 await asyncio.sleep(backoff)
                             else:
                                 raise e
-                    raise last_err or RuntimeError("Single item async embedding failed")
+                    raise last_err or RuntimeError(
+                        "Single item async embedding failed")
 
             tasks = [_aembed_single(t) for t in batch]
             return await asyncio.gather(*tasks)
 
         # Standard batching path for single items or models supporting direct list batching
-        contents_input = batch[0] if (is_gemini_2 and len(batch) == 1) else batch
+        contents_input = batch[0] if (
+            is_gemini_2 and len(batch) == 1) else batch
 
         last_error: Optional[Exception] = None
         for attempt in range(1, max_retries + 1):
@@ -842,13 +865,15 @@ async def _aembed_google_batch_with_retry(
                 last_error = e
                 err_str = str(e).lower()
                 if "404" in err_str or "not found" in err_str or "400" in err_str:
-                    logger.warning(f"Google embedding model '{model}' non-retryable error: {e}")
+                    logger.warning(
+                        f"Google embedding model '{model}' non-retryable error: {e}")
                     raise e
 
                 if attempt < max_retries:
                     backoff = (2 ** (attempt - 1)) + random.uniform(0.2, 0.6)
                     if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
-                        backoff = _extract_retry_delay(e, default_delay=backoff * 2.0)
+                        backoff = _extract_retry_delay(
+                            e, default_delay=backoff * 2.0)
                         rate_limiter.throttle(backoff)
                         logger.warning(
                             f"Async rate limit (429) hit on '{model}'. Throttling and retrying in {backoff:.2f}s..."
@@ -938,14 +963,16 @@ def _embed_jina_batch(
                     data = resp.json()
                     items = data.get("data", [])
                     # Re-sort by input index to preserve strict 1:1 order alignment with caller inputs
-                    sorted_items = sorted(items, key=lambda x: x.get("index", 0))
+                    sorted_items = sorted(
+                        items, key=lambda x: x.get("index", 0))
                     return [item["embedding"] for item in sorted_items]
 
                 status = resp.status_code
                 if status == 429:
                     # Respect upstream 'Retry-After' header if present to avoid immediate re-trigger
                     retry_after = float(resp.headers.get("Retry-After", 2.0))
-                    backoff = max(retry_after, (2 ** (attempt - 1)) + random.uniform(0.2, 0.8))
+                    backoff = max(retry_after, (2 ** (attempt - 1)
+                                                ) + random.uniform(0.2, 0.8))
                     logger.warning(
                         f"Jina AI rate limit (429) hit for '{model}'. Retrying in {backoff:.2f}s "
                         f"(attempt {attempt}/{max_retries})..."
@@ -972,7 +999,8 @@ def _embed_jina_batch(
                 else:
                     raise e
 
-        raise last_exc or RuntimeError(f"Failed to embed batch with Jina AI '{model}'")
+        raise last_exc or RuntimeError(
+            f"Failed to embed batch with Jina AI '{model}'")
 
 
 async def _aembed_jina_batch(
@@ -1033,13 +1061,15 @@ async def _aembed_jina_batch(
                     data = resp.json()
                     items = data.get("data", [])
                     # Re-sort items by input index to maintain deterministic sequence order
-                    sorted_items = sorted(items, key=lambda x: x.get("index", 0))
+                    sorted_items = sorted(
+                        items, key=lambda x: x.get("index", 0))
                     return [item["embedding"] for item in sorted_items]
 
                 status = resp.status_code
                 if status == 429:
                     retry_after = float(resp.headers.get("Retry-After", 2.0))
-                    backoff = max(retry_after, (2 ** (attempt - 1)) + random.uniform(0.2, 0.8))
+                    backoff = max(retry_after, (2 ** (attempt - 1)
+                                                ) + random.uniform(0.2, 0.8))
                     logger.warning(
                         f"Async Jina AI rate limit (429) hit for '{model}'. Retrying in {backoff:.2f}s "
                         f"(attempt {attempt}/{max_retries})..."
@@ -1065,7 +1095,8 @@ async def _aembed_jina_batch(
                 else:
                     raise e
 
-        raise last_exc or RuntimeError(f"Async embedding failed with Jina AI '{model}'")
+        raise last_exc or RuntimeError(
+            f"Async embedding failed with Jina AI '{model}'")
 
 
 # ==============================================================================
@@ -1206,6 +1237,7 @@ def embed_texts(
     max_retries: int = DEFAULT_MAX_RETRIES,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[List[float]]:
     """Embed a collection of texts with rate limiting, batching, and Jina AI fallback.
 
@@ -1240,6 +1272,7 @@ def embed_texts(
         max_retries: Max retry attempts per batch on transient errors (default: 3).
         normalize: Whether to L2-normalize vectors for cosine similarity (default: True).
         api_key: Optional Gemini API key override.
+        prefer_fallback: Whether to directly use the fallback/fallout model.
 
     Returns:
         List[List[float]]: List of embedding vectors in strict 1-to-1 correspondence with input texts.
@@ -1285,6 +1318,18 @@ def embed_texts(
                 item_count=len(batch_texts),
                 model=model,
             ):
+                # If fallout/fallback is preferred, route directly to fallback model
+                if prefer_fallback or getattr(settings, "USE_FALLOUT_MODEL", False):
+                    fallback_embs = _embed_fallback_batch(
+                        batch=batch_texts,
+                        fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
+                        dimension=dimension,
+                        task_type=task_type,
+                        timeout=timeout,
+                        api_key=api_key,
+                    )
+                    return batch_idx, fallback_embs
+
                 # Attempts primary embedding; transparently fails over only this batch slice to Jina on error
                 try:
                     embs = _embed_google_batch_with_retry(
@@ -1334,7 +1379,8 @@ def embed_texts(
                         raise primary_exc
 
         # Pre-allocated indexed slots allow worker threads to place results out-of-order safely without race conditions
-        ordered_results: List[Optional[List[List[float]]]] = [None] * num_batches
+        ordered_results: List[Optional[List[List[float]]]] = [
+            None] * num_batches
 
         if num_batches == 1:
             _, ordered_results[0] = _process_batch(0, batches[0])
@@ -1356,12 +1402,14 @@ def embed_texts(
 
         # Unit normalization enables fast inner product (dot product) vector similarity searches
         if normalize:
-            flattened_embeddings = [normalize_vector(vec) for vec in flattened_embeddings]
+            flattened_embeddings = [normalize_vector(
+                vec) for vec in flattened_embeddings]
 
         if root_span:
             root_span.set_attribute("vector_count", len(flattened_embeddings))
             if flattened_embeddings:
-                root_span.set_attribute("vector_dim", len(flattened_embeddings[0]))
+                root_span.set_attribute(
+                    "vector_dim", len(flattened_embeddings[0]))
 
         return flattened_embeddings
 
@@ -1375,6 +1423,7 @@ def embed_text(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
     """Embed a single text string using Google Gemini Embedding 2 with Jina Embeddings v4 fallback.
 
@@ -1404,6 +1453,7 @@ def embed_text(
             rpm_limit=rpm_limit,
             normalize=normalize,
             api_key=api_key,
+            prefer_fallback=prefer_fallback,
         )
         return results[0] if results else []
 
@@ -1416,6 +1466,7 @@ def embed_query(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
     """Embed a search query using Google Gemini Embedding 2 with task_type='RETRIEVAL_QUERY'.
 
@@ -1435,6 +1486,7 @@ def embed_query(
         model=model,
         dimension=dimension,
         fallback_model=fallback_model,
+        prefer_fallback=prefer_fallback,
     ):
         return embed_text(
             text=query,
@@ -1445,6 +1497,7 @@ def embed_query(
             rpm_limit=rpm_limit,
             normalize=normalize,
             api_key=api_key,
+            prefer_fallback=prefer_fallback,
         )
 
 
@@ -1462,44 +1515,27 @@ def embed_image(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
-    """Embed an image using Google Gemini Embedding 2 with Jina Embeddings v4 multimodal fallback.
-
-    What:
-        Normalizes the image input into raw PNG bytes, packages them into a Gemini Part
-        (types.Part.from_bytes), and synchronously calls client.models.embed_content.
-        If the primary model fails or encounters quota exhaustion, transparently fails over
-        to _embed_image_fallback (Jina Embeddings v4). Optionally L2-normalizes the output vector.
-
-    Why:
-        1. Native Visual Semantics: Gemini Embedding 2 embeds raw pixel data directly into
-           the same shared vector space as textual documents, enabling zero-shot cross-modal
-           retrieval (e.g., matching a natural language text query to a chart or diagram).
-        2. Format Decoupling: Accepts PIL Images, raw byte arrays, file paths, Base64 Data URIs,
-           or ExtractedImage dataclasses, insulating downstream consumers from image loader details.
-        3. Multimodal Failover: Image embedding calls consume higher quotas; automatic failover
-           to Jina v4 ensures that image-rich document ingestion pipelines do not stall during outages.
-
-    Args:
-        image: Target image representation (PIL Image, bytes, path, or Data URI).
-        model: Primary embedding model (default: 'gemini-embedding-2').
-        dimension: Desired embedding dimension (default: 768).
-        task_type: Retrieval task type (default: 'RETRIEVAL_DOCUMENT').
-        fallback_model: Fallback model (default: 'jina-embeddings-v4').
-        rpm_limit: Requests-per-minute throttle.
-        normalize: Whether to L2-normalize vectors (default: True).
-        api_key: Optional Gemini API key override.
-
-    Returns:
-        List[float]: 768-dimensional embedding vector representing the visual content.
-    """
+    """Embed an image using Google Gemini Embedding 2 with Jina Embeddings v4 multimodal fallback."""
     with _logfire_span(
         "embed_image",
         model=model,
         dimension=dimension,
         task_type=task_type,
         fallback_model=fallback_model,
+        prefer_fallback=prefer_fallback,
     ):
+        if prefer_fallback or getattr(settings, "USE_FALLOUT_MODEL", False):
+            vec = _embed_image_fallback(
+                image=image,
+                fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
+                dimension=dimension,
+                task_type=task_type,
+                api_key=api_key,
+            )
+            return normalize_vector(vec) if normalize else vec
+
         client = get_genai_client(api_key=api_key)
         rate_limiter = get_rate_limiter(rpm=rpm_limit)
         rate_limiter.acquire(1)
@@ -1519,7 +1555,8 @@ def embed_image(
             # Wrap image bytes in a Gemini Part for native visual embedding
             res = client.models.embed_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+                contents=[types.Part.from_bytes(
+                    data=img_bytes, mime_type=mime)],
                 config=config,
             )
             vec = list(res.embeddings[0].values)
@@ -1544,7 +1581,8 @@ def embed_image(
                     api_key=api_key,
                 )
             except Exception as fallback_exc:
-                logger.error(f"Multimodal image fallback '{fallback_model}' also failed: {fallback_exc}")
+                logger.error(
+                    f"Multimodal image fallback '{fallback_model}' also failed: {fallback_exc}")
                 raise fallback_exc from primary_exc
 
         return normalize_vector(vec) if normalize else vec
@@ -1560,19 +1598,9 @@ def embed_images(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[List[float]]:
-    """Concurrently embed a collection of images using Gemini Embedding 2 with Jina AI fallback.
-
-    What:
-        Dispatches embedding tasks for multiple image inputs across a ThreadPoolExecutor,
-        bounding concurrent worker threads to max_concurrency and collecting results in input sequence.
-
-    Why:
-        Image preprocessing and network transfer introduce significantly higher latency per item
-        than text chunks. Executing image requests sequentially would severely bottleneck ingestion
-        pipelines. Thread-pool concurrency maximizes throughput while the underlying TokenBucketRateLimiter
-        ensures that parallel dispatches do not exceed upstream RPM quotas.
-    """
+    """Concurrently embed a collection of images using Gemini Embedding 2 with Jina AI fallback."""
     if not images:
         return []
 
@@ -1582,8 +1610,8 @@ def embed_images(
         model=model,
         dimension=dimension,
         max_concurrency=max_concurrency,
+        prefer_fallback=prefer_fallback,
     ):
-        # Bound worker threads to concurrency limit to avoid thread explosion on large image lists
         workers = min(max_concurrency, len(images))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
@@ -1597,6 +1625,7 @@ def embed_images(
                     rpm_limit=rpm_limit,
                     normalize=normalize,
                     api_key=api_key,
+                    prefer_fallback=prefer_fallback,
                 )
                 for img in images
             ]
@@ -1660,7 +1689,8 @@ def embed_multimodal(
                 try:
                     res = client.models.embed_content(
                         model=model,
-                        contents=[pair_text, types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+                        contents=[pair_text, types.Part.from_bytes(
+                            data=img_bytes, mime_type=mime)],
                         config=config,
                     )
                     vec = list(res.embeddings[0].values)
@@ -1707,24 +1737,9 @@ async def aembed_texts(
     max_retries: int = DEFAULT_MAX_RETRIES,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[List[float]]:
-    """Asynchronously embed a collection of texts with rate limiting, batching, and Jina AI fallback.
-
-    What:
-        Non-blocking asynchronous counterpart to embed_texts. Slices sanitized texts into batches,
-        schedules them with asyncio.gather bounded by an asyncio.Semaphore, falls back to Jina per
-        batch upon failure, sorts completed batches by original index, and applies optional L2 normalization.
-
-    Why:
-        1. Async Architecture Compatibility: Modern Python web frameworks (FastAPI) and streaming
-           agentic pipelines operate on an asyncio event loop. Using blocking threads for I/O wastes
-           OS resources; asynchronous execution allows high concurrency with minimal memory overhead.
-        2. Bounded Concurrency: An asyncio.Semaphore prevents spawning thousands of concurrent coroutines
-           that would exhaust socket descriptors and trigger severe server-side throttling.
-        3. Deterministic Ordering: Asynchronous tasks complete out-of-order depending on network latency.
-           Sorting completed batch tuples by their original index guarantees that vector order strictly
-           mirrors the input text order.
-    """
+    """Asynchronously embed a collection of texts with rate limiting, batching, and Jina AI fallback."""
     if isinstance(texts, str):
         raw_list = [texts]
     else:
@@ -1740,7 +1755,6 @@ async def aembed_texts(
     rate_limiter = get_rate_limiter(rpm=rpm_limit)
     batches = _chunk_list(sanitized_texts, effective_batch_size)
     num_batches = len(batches)
-    # Semaphore throttles concurrent coroutines to prevent exhausting socket connections or tripping RPM limits
     semaphore = asyncio.Semaphore(max_concurrency)
 
     with _logfire_span(
@@ -1763,6 +1777,18 @@ async def aembed_texts(
                     item_count=len(batch_texts),
                     model=model,
                 ):
+                    # Route directly to fallback if requested
+                    if prefer_fallback or getattr(settings, "USE_FALLOUT_MODEL", False):
+                        fallback_embs = await _aembed_fallback_batch(
+                            batch=batch_texts,
+                            fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
+                            dimension=dimension,
+                            task_type=task_type,
+                            timeout=timeout,
+                            api_key=api_key,
+                        )
+                        return batch_idx, fallback_embs
+
                     try:
                         embs = await _aembed_google_batch_with_retry(
                             client=client,
@@ -1812,19 +1838,20 @@ async def aembed_texts(
         tasks = [_process_batch(i, batch) for i, batch in enumerate(batches)]
         completed = await asyncio.gather(*tasks)
 
-        # Re-sort completed batches by index to maintain deterministic sequence ordering matching inputs
         completed_sorted = sorted(completed, key=lambda x: x[0])
         flattened_embeddings: List[List[float]] = []
         for _, batch_embs in completed_sorted:
             flattened_embeddings.extend(batch_embs)
 
         if normalize:
-            flattened_embeddings = [normalize_vector(vec) for vec in flattened_embeddings]
+            flattened_embeddings = [normalize_vector(
+                vec) for vec in flattened_embeddings]
 
         if root_span:
             root_span.set_attribute("vector_count", len(flattened_embeddings))
             if flattened_embeddings:
-                root_span.set_attribute("vector_dim", len(flattened_embeddings[0]))
+                root_span.set_attribute(
+                    "vector_dim", len(flattened_embeddings[0]))
 
         return flattened_embeddings
 
@@ -1838,16 +1865,9 @@ async def aembed_text(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
-    """Asynchronously embed a single text string using Google Gemini Embedding 2 with Jina Embeddings v4 fallback.
-
-    What:
-        Asynchronous single-item convenience function routing to aembed_texts with batch_size=1 and max_concurrency=1.
-
-    Why:
-        Provides an intuitive, non-blocking single-string embedding interface for async endpoints,
-        conversational turns, and interactive query pipelines without requiring list wrapping.
-    """
+    """Asynchronously embed a single text string using Google Gemini Embedding 2 with Jina Embeddings v4 fallback."""
     with _logfire_span(
         "aembed_text",
         text_length=len(text) if text else 0,
@@ -1866,6 +1886,7 @@ async def aembed_text(
             rpm_limit=rpm_limit,
             normalize=normalize,
             api_key=api_key,
+            prefer_fallback=prefer_fallback,
         )
         return results[0] if results else []
 
@@ -1878,24 +1899,16 @@ async def aembed_query(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
-    """Asynchronously embed a search query using Google Gemini Embedding 2 with task_type='RETRIEVAL_QUERY'.
-
-    What:
-        Generates an embedding vector for a search query in an async context, setting task_type to
-        'RETRIEVAL_QUERY' and delegating to aembed_text.
-
-    Why:
-        Search endpoints in web APIs require low latency and non-blocking I/O. Asymmetric query
-        embedding aligns the query vector with indexed document passage representations, optimizing
-        cosine similarity search ranking without blocking the web server event loop.
-    """
+    """Asynchronously embed a search query using Google Gemini Embedding 2 with task_type='RETRIEVAL_QUERY'."""
     with _logfire_span(
         "aembed_query",
         query_length=len(query) if query else 0,
         model=model,
         dimension=dimension,
         fallback_model=fallback_model,
+        prefer_fallback=prefer_fallback,
     ):
         return await aembed_text(
             text=query,
@@ -1906,6 +1919,7 @@ async def aembed_query(
             rpm_limit=rpm_limit,
             normalize=normalize,
             api_key=api_key,
+            prefer_fallback=prefer_fallback,
         )
 
 
@@ -1918,25 +1932,27 @@ async def aembed_image(
     rpm_limit: Optional[int] = None,
     normalize: bool = True,
     api_key: Optional[str] = None,
+    prefer_fallback: bool = False,
 ) -> List[float]:
-    """Asynchronously embed an image using Google Gemini Embedding 2 with Jina Embeddings v4 fallback.
-
-    What:
-        Non-blocking visual embedding function. Acquires rate-limiting tokens asynchronously, wraps
-        image bytes in a Gemini Part, and executes client.aio.models.embed_content with transparent
-        failover to _aembed_image_fallback (Jina) on failure.
-
-    Why:
-        Enables non-blocking visual embeddings within async media pipelines, image upload endpoints,
-        and multimodal search routers without stalling the asyncio event loop.
-    """
+    """Asynchronously embed an image using Google Gemini Embedding 2 with Jina Embeddings v4 fallback."""
     with _logfire_span(
         "aembed_image",
         model=model,
         dimension=dimension,
         task_type=task_type,
         fallback_model=fallback_model,
+        prefer_fallback=prefer_fallback,
     ):
+        if prefer_fallback or getattr(settings, "USE_FALLOUT_MODEL", False):
+            vec = await _aembed_image_fallback(
+                image=image,
+                fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
+                dimension=dimension,
+                task_type=task_type,
+                api_key=api_key,
+            )
+            return normalize_vector(vec) if normalize else vec
+
         client = get_genai_client(api_key=api_key)
         rate_limiter = get_rate_limiter(rpm=rpm_limit)
         await rate_limiter.acquire_async(1)
@@ -1953,10 +1969,10 @@ async def aembed_image(
         config = types.EmbedContentConfig(**config_kwargs)
 
         try:
-            # Wrap image bytes in a Gemini Part for asynchronous visual embedding
             res = await client.aio.models.embed_content(
                 model=model,
-                contents=[types.Part.from_bytes(data=img_bytes, mime_type=mime)],
+                contents=[types.Part.from_bytes(
+                    data=img_bytes, mime_type=mime)],
                 config=config,
             )
             vec = list(res.embeddings[0].values)
@@ -1981,7 +1997,126 @@ async def aembed_image(
                     api_key=api_key,
                 )
             except Exception as fallback_exc:
-                logger.error(f"Async multimodal image fallback '{fallback_model}' also failed: {fallback_exc}")
+                logger.error(
+                    f"Async multimodal image fallback '{fallback_model}' also failed: {fallback_exc}")
                 raise fallback_exc from primary_exc
 
         return normalize_vector(vec) if normalize else vec
+
+
+# ==============================================================================
+# LANGCHAIN EMBEDDINGS PROTOCOL ADAPTER
+# ==============================================================================
+
+
+class GeminiMultimodalEmbeddings(Embeddings):
+    """LangChain-compatible Embeddings adapter using Google Gemini Embedding 2 with automatic Jina AI fallback.
+
+    What:
+        Implements the standard LangChain Embeddings interface (embed_documents, embed_query,
+        aembed_documents, aembed_query) atop the production-grade Gemini and Jina embeddings service.
+        Respects RPM token-bucket limits, MRL dimensions, asymmetric query/passage heads, and
+        transparent automatic failover to the fallout model.
+
+    Why:
+        Allows direct drop-in integration with any LangChain vector store (e.g. Qdrant, Chroma, PGVector),
+        LCEL chains, retrievers, and agentic workflows while maintaining resilient fallback handling.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_PRIMARY_MODEL,
+        fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+        dimension: Optional[int] = DEFAULT_DIMENSION,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        rpm_limit: Optional[int] = None,
+        prefer_fallback: bool = False,
+        normalize: bool = True,
+        api_key: Optional[str] = None,
+    ):
+        self.model = model
+        self.fallback_model = fallback_model
+        self.dimension = dimension
+        self.batch_size = batch_size
+        self.max_concurrency = max_concurrency
+        self.rpm_limit = rpm_limit
+        self.prefer_fallback = prefer_fallback or getattr(
+            settings, "USE_FALLOUT_MODEL", False)
+        self.normalize = normalize
+        self.api_key = api_key
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed document passages for ingestion using RETRIEVAL_DOCUMENT task."""
+        return embed_texts(
+            texts=texts,
+            model=self.model,
+            dimension=self.dimension,
+            batch_size=self.batch_size,
+            max_concurrency=self.max_concurrency,
+            task_type=DOCUMENT_TASK_TYPE,
+            fallback_model=self.fallback_model,
+            rpm_limit=self.rpm_limit,
+            normalize=self.normalize,
+            api_key=self.api_key,
+            prefer_fallback=self.prefer_fallback,
+        )
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embed search query for retrieval using RETRIEVAL_QUERY task."""
+        return embed_query(
+            query=text,
+            model=self.model,
+            dimension=self.dimension,
+            fallback_model=self.fallback_model,
+            rpm_limit=self.rpm_limit,
+            normalize=self.normalize,
+            api_key=self.api_key,
+            prefer_fallback=self.prefer_fallback,
+        )
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Asynchronously embed document passages for ingestion."""
+        return await aembed_texts(
+            texts=texts,
+            model=self.model,
+            dimension=self.dimension,
+            batch_size=self.batch_size,
+            max_concurrency=self.max_concurrency,
+            task_type=DOCUMENT_TASK_TYPE,
+            fallback_model=self.fallback_model,
+            rpm_limit=self.rpm_limit,
+            normalize=self.normalize,
+            api_key=self.api_key,
+            prefer_fallback=self.prefer_fallback,
+        )
+
+    async def aembed_query(self, text: str) -> List[float]:
+        """Asynchronously embed search query for retrieval."""
+        return await aembed_query(
+            query=text,
+            model=self.model,
+            dimension=self.dimension,
+            fallback_model=self.fallback_model,
+            rpm_limit=self.rpm_limit,
+            normalize=self.normalize,
+            api_key=self.api_key,
+            prefer_fallback=self.prefer_fallback,
+        )
+
+
+def retrieve_query_vector(
+    query: str,
+    prefer_fallback: bool = False,
+    model: str = DEFAULT_PRIMARY_MODEL,
+    fallback_model: Optional[str] = DEFAULT_FALLBACK_MODEL,
+    dimension: Optional[int] = DEFAULT_DIMENSION,
+) -> List[float]:
+    """Convenience helper to embed a retrieval query vector with explicit fallback/fallout model support."""
+    return embed_query(
+        query=query,
+        model=model,
+        dimension=dimension,
+        fallback_model=fallback_model,
+        prefer_fallback=prefer_fallback,
+    )

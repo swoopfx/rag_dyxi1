@@ -3,6 +3,7 @@
 from app.services.retreival.embeddings import (
     DEFAULT_FALLBACK_MODEL,
     DEFAULT_PRIMARY_MODEL,
+    GeminiMultimodalEmbeddings,
     TokenBucketRateLimiter,
     aembed_image,
     aembed_query,
@@ -18,11 +19,14 @@ from app.services.retreival.embeddings import (
     get_jina_client,
     get_rate_limiter,
     normalize_vector,
+    retrieve_query_vector,
 )
 
 __all__ = [
     "DEFAULT_PRIMARY_MODEL",
     "DEFAULT_FALLBACK_MODEL",
+    "GeminiMultimodalEmbeddings",
+    "retrieve_query_vector",
     "embed_texts",
     "embed_text",
     "embed_query",

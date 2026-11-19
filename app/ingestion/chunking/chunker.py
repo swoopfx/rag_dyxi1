@@ -260,6 +260,27 @@ class ProcessedChunk(BaseModel):
         """Convenience accessor for heading breadcrumbs."""
         return self.metadata.headings
 
+    def to_langchain_document(self) -> Any:
+        """Convert chunk to a standard LangChain Document object."""
+        from langchain_core.documents import Document
+
+        return Document(
+            page_content=self.embedding_text,
+            metadata={
+                "chunk_id": self.chunk_id,
+                "index": self.index,
+                "raw_text": self.text,
+                "source": self.metadata.source_file,
+                "page_numbers": self.metadata.page_numbers,
+                "headings": self.metadata.headings,
+                "captions": self.metadata.captions,
+                "num_tokens": self.metadata.num_tokens,
+                "doc_items_count": self.metadata.doc_items_count,
+                "is_contextualized": self.metadata.is_contextualized,
+                **self.metadata.extra,
+            },
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert chunk to a JSON-serializable dictionary."""
         return self.model_dump()
@@ -725,6 +746,155 @@ def stream_convert_and_chunk(
 # ==============================================================================
 
 
+def chunk_text(
+    text: str,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    source_file: Optional[str] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> List[ProcessedChunk]:
+    """Chunk raw text or markdown into ProcessedChunk objects using paragraph boundaries and token estimation.
+
+    Args:
+        text: Raw text or markdown string to chunk.
+        max_tokens: Maximum token budget per chunk.
+        source_file: Identifier or filename of the source file.
+        extra_metadata: Additional metadata dictionary to attach to chunks.
+
+    Returns:
+        List of ProcessedChunk objects with estimated token counts and sequential IDs.
+    """
+    if not text or not text.strip():
+        return []
+
+    estimator = GeminiTokenEstimator(max_tokens=max_tokens)
+    paragraphs = text.split("\n\n")
+    chunks: List[ProcessedChunk] = []
+
+    current_paragraphs: List[str] = []
+    current_tokens = 0
+    idx = 0
+    file_id = Path(source_file).name if source_file else "document"
+
+    for para in paragraphs:
+        p_str = para.strip()
+        if not p_str:
+            continue
+        p_tokens = estimator.count_tokens(p_str)
+
+        # Handle individual paragraph that exceeds max_tokens on its own
+        if p_tokens > max_tokens:
+            if current_paragraphs:
+                chunk_text_str = "\n\n".join(current_paragraphs)
+                chunk_id = f"{file_id}#chunk_{idx:05d}"
+                chunks.append(
+                    ProcessedChunk(
+                        chunk_id=chunk_id,
+                        index=idx,
+                        text=chunk_text_str,
+                        contextualized_text=chunk_text_str,
+                        metadata=ChunkMetadata(
+                            source_file=source_file or file_id,
+                            page_numbers=[1],
+                            headings=[],
+                            captions=[],
+                            num_tokens=current_tokens,
+                            doc_items_count=len(current_paragraphs),
+                            is_contextualized=False,
+                            extra=extra_metadata or {},
+                        ),
+                    )
+                )
+                idx += 1
+                current_paragraphs = []
+                current_tokens = 0
+
+            # Sub-split long paragraph by words
+            words = p_str.split()
+            sub_words: List[str] = []
+            for w in words:
+                sub_words.append(w)
+                if estimator.count_tokens(" ".join(sub_words)) >= max_tokens:
+                    sub_str = " ".join(sub_words)
+                    chunk_id = f"{file_id}#chunk_{idx:05d}"
+                    chunks.append(
+                        ProcessedChunk(
+                            chunk_id=chunk_id,
+                            index=idx,
+                            text=sub_str,
+                            contextualized_text=sub_str,
+                            metadata=ChunkMetadata(
+                                source_file=source_file or file_id,
+                                page_numbers=[1],
+                                headings=[],
+                                captions=[],
+                                num_tokens=estimator.count_tokens(sub_str),
+                                doc_items_count=1,
+                                is_contextualized=False,
+                                extra=extra_metadata or {},
+                            ),
+                        )
+                    )
+                    idx += 1
+                    sub_words = []
+            if sub_words:
+                sub_str = " ".join(sub_words)
+                current_paragraphs.append(sub_str)
+                current_tokens += estimator.count_tokens(sub_str)
+            continue
+
+        if current_tokens + p_tokens > max_tokens and current_paragraphs:
+            chunk_text_str = "\n\n".join(current_paragraphs)
+            chunk_id = f"{file_id}#chunk_{idx:05d}"
+            chunks.append(
+                ProcessedChunk(
+                    chunk_id=chunk_id,
+                    index=idx,
+                    text=chunk_text_str,
+                    contextualized_text=chunk_text_str,
+                    metadata=ChunkMetadata(
+                        source_file=source_file or file_id,
+                        page_numbers=[1],
+                        headings=[],
+                        captions=[],
+                        num_tokens=current_tokens,
+                        doc_items_count=len(current_paragraphs),
+                        is_contextualized=False,
+                        extra=extra_metadata or {},
+                    ),
+                )
+            )
+            idx += 1
+            current_paragraphs = [p_str]
+            current_tokens = p_tokens
+        else:
+            current_paragraphs.append(p_str)
+            current_tokens += p_tokens
+
+    if current_paragraphs:
+        chunk_text_str = "\n\n".join(current_paragraphs)
+        chunk_id = f"{file_id}#chunk_{idx:05d}"
+        chunks.append(
+            ProcessedChunk(
+                chunk_id=chunk_id,
+                index=idx,
+                text=chunk_text_str,
+                contextualized_text=chunk_text_str,
+                metadata=ChunkMetadata(
+                    source_file=source_file or file_id,
+                    page_numbers=[1],
+                    headings=[],
+                    captions=[],
+                    num_tokens=current_tokens,
+                    doc_items_count=len(current_paragraphs),
+                    is_contextualized=False,
+                    extra=extra_metadata or {},
+                ),
+            )
+        )
+
+    return chunks
+
+
 def chunk_document(
     document: Union[MultimodalDocument, DoclingDocument, str, Path, io.BytesIO, DocumentStream],
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -795,6 +965,15 @@ def chunk_document(
                     max_tokens=max_tokens,
                     merge_peers=merge_peers,
                 )
+            elif document.markdown_content or document.plain_text:
+                # Direct text chunking for plain text/unstructured documents
+                text_to_chunk = document.markdown_content or document.plain_text
+                return chunk_text(
+                    text=text_to_chunk,
+                    max_tokens=max_tokens,
+                    source_file=document.file_path or document.file_name,
+                    extra_metadata=combined_meta,
+                )
             else:
                 # If raw_document was not retained, re-stream via file_path
                 if document.file_path and Path(document.file_path).exists():
@@ -815,7 +994,7 @@ def chunk_document(
                         )
                     )
                 raise ValueError(
-                    "MultimodalDocument has no raw_document or accessible file_path to chunk."
+                    "MultimodalDocument has no raw_document, text content, or accessible file_path to chunk."
                 )
 
         # 2. Handle raw DoclingDocument instance directly
@@ -836,6 +1015,11 @@ def chunk_document(
             )
 
         # 3. File path, URL, DocumentStream, or BytesIO -> decoupled streaming pipeline
+        chunker = build_hybrid_chunker(
+            max_tokens=max_tokens,
+            merge_peers=merge_peers,
+            custom_tokenizer=custom_tokenizer,
+        )
         return list(
             stream_convert_and_chunk(
                 source=document,
@@ -848,7 +1032,7 @@ def chunk_document(
                 ocr_batch_size=ocr_batch_size,
                 table_batch_size=table_batch_size,
                 document_timeout=document_timeout,
-                chunker=custom_tokenizer,
+                chunker=chunker,
                 extra_metadata=extra_metadata,
             )
         )
@@ -892,3 +1076,33 @@ def stream_chunks(
             document_timeout=document_timeout,
             extra_metadata=extra_metadata,
         )
+
+
+def chunk_multimodal_documents(
+    documents: Sequence[MultimodalDocument],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    merge_peers: bool = True,
+    **kwargs: Any,
+) -> List[ProcessedChunk]:
+    """Batch chunk multiple MultimodalDocument instances into a single unified list of chunks.
+
+    Args:
+        documents: Sequence of MultimodalDocument instances (from load_directory or load_file).
+        max_tokens: Maximum token budget allocated per chunk.
+        merge_peers: Whether to merge consecutive undersized items sharing the same parent heading.
+        **kwargs: Additional parameters passed to chunk_document.
+
+    Returns:
+        Flattened list of all ProcessedChunk objects across all input documents.
+    """
+    all_chunks: List[ProcessedChunk] = []
+    for doc in documents:
+        doc_chunks = chunk_document(
+            document=doc,
+            max_tokens=max_tokens,
+            merge_peers=merge_peers,
+            **kwargs,
+        )
+        all_chunks.extend(doc_chunks)
+    return all_chunks
+

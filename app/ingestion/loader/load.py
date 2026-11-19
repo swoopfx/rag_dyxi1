@@ -8,15 +8,27 @@ with support for PDFs, images, DOCX, PPTX, HTML, and other file formats.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+import re
+from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Union
 
 import pandas as pd
 from loguru import logger
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
+
+# Google GenAI imports for Vision
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None  # type: ignore
+    types = None  # type: ignore
+
+from app.config import settings
 
 # Docling imports
 from docling.datamodel.base_models import InputFormat
@@ -33,7 +45,61 @@ from docling_core.types.doc import (
     TextItem,
 )
 
+# Logfire observability
+try:
+    import logfire
+except ImportError:
+    logfire = None
+
+
+class _NoopSpan:
+    def set_attribute(self, key: str, value: Any) -> None:
+        pass
+
+    def set_attributes(self, attributes: Dict[str, Any]) -> None:
+        pass
+
+    def record_exception(self, exception: BaseException) -> None:
+        pass
+
+
+_NOOP_SPAN = _NoopSpan()
+
+
+@contextlib.contextmanager
+def _logfire_span(name: str, **kwargs: Any):
+    if logfire is not None:
+        with logfire.span(name, **kwargs) as span:
+            yield span
+    else:
+        yield _NOOP_SPAN
+
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+SUPPORTED_DOCUMENT_EXTENSIONS: set[str] = {
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".pptx",
+    ".ppt",
+    ".xlsx",
+    ".xls",
+    ".csv",
+    ".html",
+    ".htm",
+    ".md",
+    ".txt",
+    ".text",
+    ".json",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tiff",
+    ".tif",
+    ".bmp",
+    ".webp",
+    ".gif",
+}
 
 
 # ==============================================================================
@@ -61,6 +127,94 @@ class BoundingBox(BaseModel):
         return abs(self.t - self.b)
 
 
+# ==============================================================================
+# GEMINI VISION IMAGE DESCRIPTION (LOW-LEVEL VISION MODEL)
+# ==============================================================================
+
+
+def describe_image_with_gemini(
+    image: Union[Image.Image, bytes, bytearray, str, Path],
+    model: Optional[str] = None,
+    fallback_model: Optional[str] = None,
+    prompt: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """Generate a rich, search-optimized visual description using Gemini Flash Vision.
+
+    What:
+        Inspects an image (architecture diagram, plot, photo, flowchart, UI mock) and
+        generates a dense 2-3 sentence semantic description for vector embedding and
+        relational database storage.
+
+    Why:
+        Enables high-recall vector search against uncaptioned diagrams, figures, and plots
+        by converting visual content and embedded text into search-indexable keywords.
+    """
+    key = api_key or getattr(settings, "GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
+    if not key or genai is None or types is None:
+        logger.debug("Gemini client or API key not available for vision description.")
+        return ""
+
+    # Convert input to image bytes and mime type
+    img_bytes: bytes = b""
+    mime = "image/png"
+
+    try:
+        if isinstance(image, Image.Image):
+            buf = io.BytesIO()
+            fmt = image.format or "PNG"
+            save_img = image
+            if fmt.upper() == "JPEG" and save_img.mode in ("RGBA", "P"):
+                save_img = save_img.convert("RGB")
+            save_img.save(buf, format=fmt)
+            img_bytes = buf.getvalue()
+            mime = f"image/{fmt.lower()}"
+        elif isinstance(image, (bytes, bytearray)):
+            img_bytes = bytes(image)
+        elif isinstance(image, (str, Path)):
+            p = Path(image)
+            if p.exists() and p.is_file():
+                img_bytes = p.read_bytes()
+                guessed, _ = mimetypes.guess_type(str(p))
+                if guessed:
+                    mime = guessed
+    except Exception as conv_err:
+        logger.debug(f"Failed to convert image to bytes for vision model: {conv_err}")
+        return ""
+
+    if not img_bytes:
+        return ""
+
+    target_model = model or getattr(settings, "GEMINI_VISION_MODEL", "gemini-flash-latest")
+    fallback = fallback_model or getattr(settings, "FALLBACK_VISION_MODEL", "gemini-3.1-flash-lite")
+    active_prompt = prompt or (
+        "Describe this image concisely in 2-3 sentences for search retrieval and indexing. "
+        "Explicitly mention: 1) What it depicts (diagram, chart, UI, flowchart, photo), "
+        "2) Key visible labels, headings, and data numbers, and "
+        "3) Core findings or architectural connections."
+    )
+
+    client = genai.Client(api_key=key)
+    part = types.Part.from_bytes(data=img_bytes, mime_type=mime)
+
+    with _logfire_span("gemini_vision.describe_image", model=target_model, byte_size=len(img_bytes)):
+        for attempt_model in [target_model, fallback]:
+            try:
+                res = client.models.generate_content(
+                    model=attempt_model,
+                    contents=[part, active_prompt],
+                )
+                if res and res.text:
+                    desc = res.text.strip()
+                    logger.debug(f"Gemini Flash Vision generated description ({len(desc)} chars) via '{attempt_model}'.")
+                    return desc
+            except Exception as e:
+                logger.warning(f"Gemini vision description attempt with '{attempt_model}' failed: {e}")
+                continue
+
+    return ""
+
+
 class ExtractedImage(BaseModel):
     """Extracted image or visual element (figure, chart, picture, diagram)."""
 
@@ -84,6 +238,46 @@ class ExtractedImage(BaseModel):
     annotations: List[str] = Field(
         default_factory=list, description="Any classifications or annotations"
     )
+    description: Optional[str] = Field(
+        default=None,
+        description="Detailed visual description generated by Gemini Flash Vision",
+    )
+    summary: Optional[str] = Field(
+        default=None, description="Concise semantic summary of the visual element for vector search"
+    )
+
+    def generate_summary(self, use_vision: bool = True) -> str:
+        """Generate a semantic summary of the visual element for vector search."""
+        if self.summary and self.description:
+            return self.summary
+
+        # Auto-describe using low-level Gemini Flash Vision if enabled
+        enable_vision = getattr(settings, "ENABLE_VISION_IMAGE_DESCRIPTION", True)
+        if use_vision and enable_vision and not self.description:
+            img_source = self.image or self.saved_path
+            if img_source is not None:
+                try:
+                    desc = describe_image_with_gemini(img_source)
+                    if desc:
+                        self.description = desc
+                except Exception as e:
+                    logger.debug(f"Gemini vision description skipped: {e}")
+
+        parts = [f"Visual element ({self.label}):"]
+        if self.caption:
+            parts.append(f"Caption: '{self.caption}'.")
+        if self.description:
+            parts.append(f"Visual Description: {self.description}")
+        if self.page_no:
+            parts.append(f"Page {self.page_no}.")
+        if self.annotations:
+            parts.append(f"Annotations: {', '.join(self.annotations)}.")
+        if self.saved_path:
+            parts.append(f"File: {Path(self.saved_path).name}.")
+
+        summary_val = " ".join(parts).strip()
+        self.summary = summary_val
+        return summary_val
 
     def save(self, output_path: Union[str, Path]) -> Path:
         """Save the image to disk."""
@@ -118,6 +312,73 @@ class ExtractedTable(BaseModel):
     table_image: Optional[ExtractedImage] = Field(
         default=None, description="Visual crop of the table if enabled"
     )
+    summary: Optional[str] = Field(
+        default=None, description="Concise semantic summary of the table for vector search"
+    )
+
+    def generate_summary(self) -> str:
+        """Generate a semantic summary of table schema, columns, and sample entries."""
+        if self.summary:
+            return self.summary
+
+        parts = []
+        if self.caption:
+            parts.append(f"Table title/caption: {self.caption}.")
+        if self.page_no:
+            parts.append(f"Located on page {self.page_no}.")
+
+        cols: List[str] = []
+        if self.dataframe is not None and not self.dataframe.empty:
+            cols = [str(c) for c in self.dataframe.columns]
+        elif self.data_rows and len(self.data_rows) > 0:
+            cols = [str(c) for c in self.data_rows[0]]
+
+        if cols:
+            parts.append(f"Columns: {', '.join(cols)}.")
+        parts.append(f"Dimensions: {self.num_rows} rows by {self.num_cols} columns.")
+
+        sample_items = []
+        if self.data_rows and len(self.data_rows) > 1:
+            for r in self.data_rows[1:4]:
+                sample_items.append(" | ".join(str(val) for val in r if str(val).strip()))
+        elif self.dataframe is not None and not self.dataframe.empty:
+            for _, row in self.dataframe.head(3).iterrows():
+                sample_items.append(" | ".join(str(val) for val in row.values if str(val).strip()))
+
+        if sample_items:
+            parts.append(f"Sample data entries: {'; '.join(sample_items)}.")
+
+        summary_val = " ".join(parts).strip() or "Structured table containing data."
+        self.summary = summary_val
+        return summary_val
+
+
+class ExtractedFormula(BaseModel):
+    """Extracted mathematical formula or equation formatted in LaTeX."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    index: int = Field(..., description="Order index of the formula")
+    latex: str = Field(..., description="Raw LaTeX formula string (e.g. $E=mc^2$ or display math)")
+    context: Optional[str] = Field(default=None, description="Surrounding contextual text or heading")
+    page_no: Optional[int] = Field(default=None, description="Page number where formula appears")
+    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on page")
+    summary: Optional[str] = Field(
+        default=None, description="Semantic summary for vector search embedding"
+    )
+
+    def generate_summary(self) -> str:
+        """Generate a searchable summary of the LaTeX formula."""
+        if self.summary:
+            return self.summary
+        parts = ["Mathematical Formula in LaTeX:", self.latex]
+        if self.context:
+            parts.append(f"Context: {self.context}.")
+        if self.page_no:
+            parts.append(f"Page: {self.page_no}.")
+        summary_val = " ".join(parts).strip()
+        self.summary = summary_val
+        return summary_val
 
 
 class DocumentElement(BaseModel):
@@ -158,6 +419,9 @@ class MultimodalDocument(BaseModel):
     images: List[ExtractedImage] = Field(
         default_factory=list, description="Extracted images, figures, and charts"
     )
+    formulas: List[ExtractedFormula] = Field(
+        default_factory=list, description="Extracted mathematical formulas formatted in LaTeX"
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict, description="Document metadata and statistics"
     )
@@ -174,6 +438,49 @@ class MultimodalDocument(BaseModel):
     def has_tables(self) -> bool:
         """Check if document contains extracted tables."""
         return len(self.tables) > 0
+
+    @property
+    def has_formulas(self) -> bool:
+        """Check if document contains extracted formulas."""
+        return len(self.formulas) > 0
+
+    @property
+    def has_nontextual_content(self) -> bool:
+        """Check if document contains any extracted tables, images, or formulas."""
+        return self.has_images or self.has_tables or self.has_formulas
+
+    def get_nontextual_summary(self) -> Dict[str, Any]:
+        """Summary of nontextual tables, images, and formulas for logging and database records."""
+        return {
+            "tables_count": len(self.tables),
+            "images_count": len(self.images),
+            "formulas_count": len(self.formulas),
+            "table_captions": [t.caption for t in self.tables if t.caption],
+            "image_captions": [img.caption for img in self.images if img.caption],
+            "image_labels": [img.label for img in self.images if img.label],
+            "formulas": [f.latex for f in self.formulas],
+        }
+
+    def to_langchain_documents(self) -> List[Any]:
+        """Convert document content into standard LangChain Document instances."""
+        from langchain_core.documents import Document
+
+        return [
+            Document(
+                page_content=self.markdown_content or self.plain_text,
+                metadata={
+                    "source": self.file_path or self.file_name,
+                    "file_name": self.file_name,
+                    "file_extension": self.file_extension,
+                    "num_pages": self.num_pages,
+                    "has_tables": self.has_tables,
+                    "has_images": self.has_images,
+                    "num_tables": len(self.tables),
+                    "num_images": len(self.images),
+                    **self.metadata,
+                },
+            )
+        ]
 
     def get_headings(self) -> List[DocumentElement]:
         """Return all heading elements from the document."""
@@ -323,6 +630,44 @@ def load_file(
         source = file_path
 
     logger.info(f"Loading multimodal document from {source} (type: {file_ext})")
+
+    # Quick fallback for standard plain text files without requiring Docling converter
+    if path is not None and file_ext in {".txt", ".text", ".log", ".json", ".yaml", ".yml"}:
+        try:
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.error(f"Failed to read text file {path}: {e}")
+            raise
+
+        elem = DocumentElement(
+            index=0,
+            type="text",
+            text=raw_text,
+            page_no=1,
+            bbox=None,
+        )
+        return MultimodalDocument(
+            file_path=str(path),
+            file_name=file_name,
+            file_extension=file_ext,
+            file_size_bytes=file_size,
+            mime_type=mime_type or "text/plain",
+            num_pages=1,
+            markdown_content=raw_text,
+            plain_text=raw_text,
+            elements=[elem],
+            tables=[],
+            images=[],
+            metadata={
+                "num_pages": 1,
+                "num_elements": 1,
+                "num_tables": 0,
+                "num_images": 0,
+                "file_extension": file_ext,
+                "mime_type": mime_type or "text/plain",
+            },
+            raw_document=None,
+        )
 
     # Prepare images destination directory if requested
     target_img_dir: Optional[Path] = None
@@ -603,6 +948,49 @@ def load_file(
             except Exception as e:
                 logger.debug(f"Could not load source image file directly: {e}")
 
+    # --------------------------------------------------------------------------
+    # 4. Extract Mathematical Formulas (LaTeX)
+    # --------------------------------------------------------------------------
+    extracted_formulas: List[ExtractedFormula] = []
+    formula_idx = 0
+
+    # A) Extract formulas detected during element iteration
+    for elem in elements:
+        if elem.type == "formula" and elem.text.strip():
+            f_obj = ExtractedFormula(
+                index=formula_idx,
+                latex=elem.text.strip(),
+                context=None,
+                page_no=elem.page_no,
+                bbox=elem.bbox,
+            )
+            f_obj.generate_summary()
+            extracted_formulas.append(f_obj)
+            formula_idx += 1
+
+    # B) Regex scan markdown content for LaTeX blocks ($$ ... $$ or \[ ... \]) if not captured by docling
+    if len(extracted_formulas) == 0 and markdown_content:
+        latex_matches = re.finditer(r"\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]", markdown_content)
+        for m in latex_matches:
+            f_text = (m.group(1) or m.group(2) or "").strip()
+            if f_text:
+                f_obj = ExtractedFormula(
+                    index=formula_idx,
+                    latex=f"$${f_text}$$",
+                    context=None,
+                    page_no=1,
+                    bbox=None,
+                )
+                f_obj.generate_summary()
+                extracted_formulas.append(f_obj)
+                formula_idx += 1
+
+    # Ensure all tables and images have summaries generated
+    for tbl in extracted_tables:
+        tbl.generate_summary()
+    for img in extracted_images:
+        img.generate_summary()
+
     # Document statistics & metadata
     num_pages = 1
     try:
@@ -619,13 +1007,15 @@ def load_file(
         "num_elements": len(elements),
         "num_tables": len(extracted_tables),
         "num_images": len(extracted_images),
+        "num_formulas": len(extracted_formulas),
         "file_extension": file_ext,
         "mime_type": mime_type,
     }
 
     logger.info(
         f"Successfully loaded '{file_name}': {len(elements)} elements, "
-        f"{len(extracted_tables)} tables, {len(extracted_images)} images, {num_pages} pages."
+        f"{len(extracted_tables)} tables, {len(extracted_images)} images, "
+        f"{len(extracted_formulas)} formulas, {num_pages} pages."
     )
 
     return MultimodalDocument(
@@ -640,6 +1030,7 @@ def load_file(
         elements=elements,
         tables=extracted_tables,
         images=extracted_images,
+        formulas=extracted_formulas,
         metadata=metadata,
         raw_document=doc,
     )
@@ -648,3 +1039,80 @@ def load_file(
 # Convenient aliases
 load_document = load_file
 load_multimodal_document = load_file
+
+
+# ==============================================================================
+# DIRECTORY SCANNING & RECURSIVE INGESTION UTILITIES
+# ==============================================================================
+
+
+def scan_directory(
+    directory_path: Union[str, Path],
+    recursive: bool = True,
+    extensions: Optional[set[str]] = None,
+) -> List[Path]:
+    """Scan a directory for supported document, image, and data files.
+
+    Args:
+        directory_path: Root folder path to inspect.
+        recursive: Whether to traverse nested child folders.
+        extensions: Optional whitelist of extensions (defaults to SUPPORTED_DOCUMENT_EXTENSIONS).
+
+    Returns:
+        List of Path objects for all matching files, sorted deterministically.
+    """
+    root = Path(directory_path).resolve()
+    if not root.exists() or not root.is_dir():
+        logger.warning(f"Scan directory does not exist or is not a directory: {root}")
+        return []
+
+    target_exts = {e.lower() for e in (extensions or SUPPORTED_DOCUMENT_EXTENSIONS)}
+    matched_files: List[Path] = []
+
+    pattern = "**/*" if recursive else "*"
+    for item in root.glob(pattern):
+        if item.is_file() and item.suffix.lower() in target_exts:
+            matched_files.append(item)
+
+    matched_files.sort(key=lambda p: str(p).lower())
+    logger.info(
+        f"Found {len(matched_files)} document(s) in '{root}' (recursive={recursive})"
+    )
+    return matched_files
+
+
+def load_directory(
+    directory_path: Union[str, Path],
+    recursive: bool = True,
+    extensions: Optional[set[str]] = None,
+    ignore_errors: bool = True,
+    **load_kwargs: Any,
+) -> Iterator[MultimodalDocument]:
+    """Recursively scan a directory and load all supported documents.
+
+    Args:
+        directory_path: Target directory to read documents from.
+        recursive: Whether to scan subdirectories.
+        extensions: Optional whitelist of extensions.
+        ignore_errors: If True, log exceptions on unparseable files and continue.
+        **load_kwargs: Parameters forwarded to load_file.
+
+    Yields:
+        MultimodalDocument for each successfully parsed file.
+    """
+    with _logfire_span(
+        "loader.load_directory",
+        directory=str(directory_path),
+        recursive=recursive,
+    ):
+        files = scan_directory(directory_path, recursive=recursive, extensions=extensions)
+        for file_path in files:
+            try:
+                doc = load_file(file_path, **load_kwargs)
+                yield doc
+            except Exception as e:
+                if ignore_errors:
+                    logger.warning(f"Skipping failed document '{file_path}': {e}")
+                    continue
+                raise
+
