@@ -48,60 +48,10 @@ except ImportError:
 
 from app.config import settings
 
-# Logfire Observability Setup
-try:
-    import logfire
+# Observability
+from app.observability import observe, observe_block
 
-    _logfire_token = getattr(settings, "LOGFIRE_TOKEN",
-                             None) or os.getenv("LOGFIRE_TOKEN")
-    logfire.configure(
-        send_to_logfire="if-token-present",
-        token=_logfire_token,
-        service_name="rag-embeddings-service",
-    )
-    # Automatically stream Loguru logs into active Logfire spans
-    try:
-        logger.add(**logfire.loguru_handler())
-    except Exception:
-        pass
-except ImportError:
-    logfire = None
-
-
-class _NoopSpan:
-    """No-op span placeholder for when Logfire is not available or initialized."""
-
-    def set_attribute(self, key: str, value: Any) -> None:
-        pass
-
-    def set_attributes(self, attributes: Dict[str, Any]) -> None:
-        pass
-
-    def record_exception(self, exception: BaseException) -> None:
-        pass
-
-
-_NOOP_SPAN = _NoopSpan()
-
-
-@contextmanager
-def _logfire_span(name: str, **kwargs: Any):
-    """Context manager for Logfire distributed tracing and span telemetry.
-
-    What:
-        Encloses execution within a named Logfire span with structured attributes,
-        automatically tracking execution time and recording unhandled exceptions.
-        If Logfire is not installed or available, safely yields a no-op span.
-
-    Why:
-        Provides centralized observability, performance monitoring, and error tracing
-        for all embedding operations with zero overhead when running without Logfire credentials.
-    """
-    if logfire is not None:
-        with logfire.span(name, **kwargs) as span:
-            yield span
-    else:
-        yield _NOOP_SPAN
+_logfire_span = observe_block
 
 
 # HTTP client for Jina AI API
@@ -157,6 +107,7 @@ ImageInput = Union[Image.Image, bytes, bytearray, str, Path, Any]
 # ==============================================================================
 
 
+@observe()
 class TokenBucketRateLimiter:
     """Thread-safe and async-safe Token Bucket Rate Limiter.
 
@@ -302,6 +253,7 @@ class TokenBucketRateLimiter:
                 )
 
 
+@observe()
 def get_rate_limiter(rpm: Optional[int] = None) -> TokenBucketRateLimiter:
     """Retrieve or instantiate a cached TokenBucketRateLimiter for the given RPM.
 
@@ -357,6 +309,7 @@ def _extract_retry_delay(exc: Exception, default_delay: float) -> float:
 # ==============================================================================
 
 
+@observe()
 def get_genai_client(api_key: Optional[str] = None) -> genai.Client:
     """Get or initialize a cached Google GenAI Client instance.
 
@@ -405,6 +358,7 @@ def _get_jina_api_key(api_key: Optional[str] = None) -> Optional[str]:
     )
 
 
+@observe()
 def get_jina_client(timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.Client:
     """Get or initialize a cached synchronous httpx.Client for Jina AI API calls.
 
@@ -427,6 +381,7 @@ def get_jina_client(timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.Client:
     return _JINA_CLIENT
 
 
+@observe()
 def get_async_jina_client(timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.AsyncClient:
     """Get or initialize a cached asynchronous httpx.AsyncClient for Jina AI API calls.
 
@@ -455,6 +410,7 @@ def get_async_jina_client(timeout: float = DEFAULT_TIMEOUT_SECONDS) -> httpx.Asy
 # ==============================================================================
 
 
+@observe()
 def normalize_vector(vector: Sequence[float]) -> List[float]:
     """L2-normalizes an embedding vector for exact cosine similarity search.
 
@@ -614,6 +570,7 @@ def _map_task_to_jina(task_type: Optional[str]) -> str:
 # ==============================================================================
 
 
+@observe()
 def _embed_google_batch_with_retry(
     client: genai.Client,
     batch: List[str],
@@ -760,6 +717,7 @@ def _embed_google_batch_with_retry(
         raise last_error or RuntimeError("Unexpected embedding failure")
 
 
+@observe()
 async def _aembed_google_batch_with_retry(
     client: genai.Client,
     batch: List[str],
@@ -898,6 +856,7 @@ async def _aembed_google_batch_with_retry(
 # ==============================================================================
 
 
+@observe()
 def _embed_jina_batch(
     inputs: List[Union[str, Dict[str, Any]]],
     model: str = DEFAULT_FALLBACK_MODEL,
@@ -1003,6 +962,7 @@ def _embed_jina_batch(
             f"Failed to embed batch with Jina AI '{model}'")
 
 
+@observe()
 async def _aembed_jina_batch(
     inputs: List[Union[str, Dict[str, Any]]],
     model: str = DEFAULT_FALLBACK_MODEL,
@@ -1104,6 +1064,7 @@ async def _aembed_jina_batch(
 # ==============================================================================
 
 
+@observe()
 def _embed_fallback_batch(
     batch: List[str],
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
@@ -1133,6 +1094,7 @@ def _embed_fallback_batch(
     )
 
 
+@observe()
 async def _aembed_fallback_batch(
     batch: List[str],
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
@@ -1161,6 +1123,7 @@ async def _aembed_fallback_batch(
     )
 
 
+@observe()
 def _embed_image_fallback(
     image: ImageInput,
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
@@ -1191,6 +1154,7 @@ def _embed_image_fallback(
         return embs[0]
 
 
+@observe()
 async def _aembed_image_fallback(
     image: ImageInput,
     fallback_model: str = DEFAULT_FALLBACK_MODEL,
@@ -1224,6 +1188,7 @@ async def _aembed_image_fallback(
 # ==============================================================================
 
 
+@observe()
 def embed_texts(
     texts: Union[str, List[str]],
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1405,15 +1370,24 @@ def embed_texts(
             flattened_embeddings = [normalize_vector(
                 vec) for vec in flattened_embeddings]
 
+        total_chars = sum(len(t) for t in sanitized_texts)
+        est_tokens = sum(max(1, max(int(len(t.split()) * 1.3), len(t) // 4)) for t in sanitized_texts)
+
         if root_span:
             root_span.set_attribute("vector_count", len(flattened_embeddings))
             if flattened_embeddings:
                 root_span.set_attribute(
                     "vector_dim", len(flattened_embeddings[0]))
+            root_span.set_attribute("tokens.estimated_total", est_tokens)
+            root_span.set_attribute("tokens.character_count", total_chars)
+            root_span.set_attribute("tokens.avg_tokens_per_item", round(est_tokens / len(sanitized_texts), 2) if sanitized_texts else 0.0)
+            root_span.set_attribute("embeddings.vector_count", len(flattened_embeddings))
+            root_span.set_attribute("embeddings.dimension", len(flattened_embeddings[0]) if flattened_embeddings else 0)
 
         return flattened_embeddings
 
 
+@observe()
 def embed_text(
     text: str,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1458,6 +1432,7 @@ def embed_text(
         return results[0] if results else []
 
 
+@observe()
 def embed_query(
     query: str,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1506,6 +1481,7 @@ def embed_query(
 # ==============================================================================
 
 
+@observe()
 def embed_image(
     image: ImageInput,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1588,6 +1564,7 @@ def embed_image(
         return normalize_vector(vec) if normalize else vec
 
 
+@observe()
 def embed_images(
     images: Sequence[ImageInput],
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1632,6 +1609,7 @@ def embed_images(
             return [f.result() for f in futures]
 
 
+@observe()
 def embed_multimodal(
     items: Sequence[Union[str, ImageInput, Dict[str, Any]]],
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1724,6 +1702,7 @@ def embed_multimodal(
 # ==============================================================================
 
 
+@observe()
 async def aembed_texts(
     texts: Union[str, List[str]],
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1847,15 +1826,24 @@ async def aembed_texts(
             flattened_embeddings = [normalize_vector(
                 vec) for vec in flattened_embeddings]
 
+        total_chars = sum(len(t) for t in sanitized_texts)
+        est_tokens = sum(max(1, max(int(len(t.split()) * 1.3), len(t) // 4)) for t in sanitized_texts)
+
         if root_span:
             root_span.set_attribute("vector_count", len(flattened_embeddings))
             if flattened_embeddings:
                 root_span.set_attribute(
                     "vector_dim", len(flattened_embeddings[0]))
+            root_span.set_attribute("tokens.estimated_total", est_tokens)
+            root_span.set_attribute("tokens.character_count", total_chars)
+            root_span.set_attribute("tokens.avg_tokens_per_item", round(est_tokens / len(sanitized_texts), 2) if sanitized_texts else 0.0)
+            root_span.set_attribute("embeddings.vector_count", len(flattened_embeddings))
+            root_span.set_attribute("embeddings.dimension", len(flattened_embeddings[0]) if flattened_embeddings else 0)
 
         return flattened_embeddings
 
 
+@observe()
 async def aembed_text(
     text: str,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1891,6 +1879,7 @@ async def aembed_text(
         return results[0] if results else []
 
 
+@observe()
 async def aembed_query(
     query: str,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -1923,6 +1912,7 @@ async def aembed_query(
         )
 
 
+@observe()
 async def aembed_image(
     image: ImageInput,
     model: str = DEFAULT_PRIMARY_MODEL,
@@ -2009,6 +1999,7 @@ async def aembed_image(
 # ==============================================================================
 
 
+@observe()
 class GeminiMultimodalEmbeddings(Embeddings):
     """LangChain-compatible Embeddings adapter using Google Gemini Embedding 2 with automatic Jina AI fallback.
 
@@ -2105,6 +2096,7 @@ class GeminiMultimodalEmbeddings(Embeddings):
         )
 
 
+@observe()
 def retrieve_query_vector(
     query: str,
     prefer_fallback: bool = False,

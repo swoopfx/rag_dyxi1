@@ -56,7 +56,7 @@ function Get-EnvValue([string]$key, [string]$defaultVal) {
 if (-not $HostName) { $HostName = Get-EnvValue "MYSQL_HOST" "localhost" }
 if ($Port -eq 0) { $Port = [int](Get-EnvValue "MYSQL_PORT" "3306") }
 if (-not $User) { $User = Get-EnvValue "MYSQL_USER" "root" }
-if (-not $Password) { $Password = Get-EnvValue "MYSQL_PASSWORD" "" }
+if (-not $Password) { $Password = Get-EnvValue "MYSQL_PASSWORD" "Oluwaseun1@" }
 if (-not $Database) { $Database = Get-EnvValue "MYSQL_DATABASE" "rag_metadata" }
 if (-not $File) { $File = $DefaultSqlFile }
 

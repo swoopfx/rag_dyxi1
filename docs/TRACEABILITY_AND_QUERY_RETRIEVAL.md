@@ -52,14 +52,14 @@ Limits execution to a fixed number of documents (e.g. `--max-files 10`). Useful 
 
 ## 3. Shared Foreign Key & Identifier Contracts
 
-Every entity possesses a deterministic identifier shared between MySQL and Qdrant (`dyxi_stag`):
+Every entity possesses a deterministic identifier shared between MySQL and Qdrant (`dyxi_stag`). Table names are fully configurable via `.env` (`TABLE_NAME_DOCUMENTS`, `TABLE_NAME_TABLES`, `TABLE_NAME_IMAGES`, `TABLE_NAME_FORMULAS`):
 
-| Entity Type | Shared Foreign Key | Formula | MySQL Table & Column | Qdrant Point Payload |
+| Entity Type | Shared Foreign Key | Formula | MySQL Table (Configurable via `.env`) & Column | Qdrant Point Payload |
 |---|---|---|---|---|
-| **Document** | `document_id` | `uuid.uuid5(NAMESPACE_URL, file_path)` | `rag_document_metadata.document_id` (Unique Index) | `payload["document_id"]` |
-| **Table** | `table_id` | `{document_id}#table_{index:03d}` | `rag_extracted_tables.table_id` (Unique Index) | `payload["table_id"]` |
-| **LaTeX Formula** | `formula_id` | `{document_id}#formula_{index:03d}` | `rag_extracted_formulas.formula_id` (Unique Index) | `payload["formula_id"]` |
-| **Image** | `image_id` | `{document_id}#image_{index:03d}` | `rag_extracted_images.image_id` (Unique Index) | `payload["image_id"]` |
+| **Document** | `document_id` | `uuid.uuid5(NAMESPACE_URL, file_path)` | `${TABLE_NAME_DOCUMENTS}.document_id` (Unique Index) | `payload["document_id"]` |
+| **Table** | `table_id` | `{document_id}#table_{index:03d}` | `${TABLE_NAME_TABLES}.table_id` (Unique Index) | `payload["table_id"]` |
+| **LaTeX Formula** | `formula_id` | `{document_id}#formula_{index:03d}` | `${TABLE_NAME_FORMULAS}.formula_id` (Unique Index) | `payload["formula_id"]` |
+| **Image** | `image_id` | `{document_id}#image_{index:03d}` | `${TABLE_NAME_IMAGES}.image_id` (Unique Index) | `payload["image_id"]` |
 | **Text Chunk** | `chunk_id` | `{file_name}#chunk_{index:05d}` | Referenceable via `file_name` & `page_no` | `payload["chunk_id"]` |
 
 ---

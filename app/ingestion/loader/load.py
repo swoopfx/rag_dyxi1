@@ -45,37 +45,14 @@ from docling_core.types.doc import (
     TextItem,
 )
 
-# Logfire observability
-try:
-    import logfire
-except ImportError:
-    logfire = None
+# Observability
+from app.observability import observe, observe_block
+
+_logfire_span = observe_block
 
 
-class _NoopSpan:
-    def set_attribute(self, key: str, value: Any) -> None:
-        pass
-
-    def set_attributes(self, attributes: Dict[str, Any]) -> None:
-        pass
-
-    def record_exception(self, exception: BaseException) -> None:
-        pass
-
-
-_NOOP_SPAN = _NoopSpan()
-
-
-@contextlib.contextmanager
-def _logfire_span(name: str, **kwargs: Any):
-    if logfire is not None:
-        with logfire.span(name, **kwargs) as span:
-            yield span
-    else:
-        yield _NOOP_SPAN
-
-
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg",
+                    ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 SUPPORTED_DOCUMENT_EXTENSIONS: set[str] = {
     ".pdf",
     ".docx",
@@ -88,6 +65,9 @@ SUPPORTED_DOCUMENT_EXTENSIONS: set[str] = {
     ".html",
     ".htm",
     ".md",
+    ".markdown",
+    ".mdown",
+    ".mkd",
     ".txt",
     ".text",
     ".json",
@@ -132,6 +112,7 @@ class BoundingBox(BaseModel):
 # ==============================================================================
 
 
+@observe()
 def describe_image_with_gemini(
     image: Union[Image.Image, bytes, bytearray, str, Path],
     model: Optional[str] = None,
@@ -150,9 +131,11 @@ def describe_image_with_gemini(
         Enables high-recall vector search against uncaptioned diagrams, figures, and plots
         by converting visual content and embedded text into search-indexable keywords.
     """
-    key = api_key or getattr(settings, "GEMINI_API_KEY", None) or os.getenv("GEMINI_API_KEY")
+    key = api_key or getattr(settings, "GEMINI_API_KEY",
+                             None) or os.getenv("GEMINI_API_KEY")
     if not key or genai is None or types is None:
-        logger.debug("Gemini client or API key not available for vision description.")
+        logger.debug(
+            "Gemini client or API key not available for vision description.")
         return ""
 
     # Convert input to image bytes and mime type
@@ -179,14 +162,17 @@ def describe_image_with_gemini(
                 if guessed:
                     mime = guessed
     except Exception as conv_err:
-        logger.debug(f"Failed to convert image to bytes for vision model: {conv_err}")
+        logger.debug(
+            f"Failed to convert image to bytes for vision model: {conv_err}")
         return ""
 
     if not img_bytes:
         return ""
 
-    target_model = model or getattr(settings, "GEMINI_VISION_MODEL", "gemini-flash-latest")
-    fallback = fallback_model or getattr(settings, "FALLBACK_VISION_MODEL", "gemini-3.1-flash-lite")
+    target_model = model or getattr(
+        settings, "GEMINI_VISION_MODEL", "gemini-flash-latest")
+    fallback = fallback_model or getattr(
+        settings, "FALLBACK_VISION_MODEL", "gemini-3.1-flash-lite")
     active_prompt = prompt or (
         "Describe this image concisely in 2-3 sentences for search retrieval and indexing. "
         "Explicitly mention: 1) What it depicts (diagram, chart, UI, flowchart, photo), "
@@ -206,29 +192,39 @@ def describe_image_with_gemini(
                 )
                 if res and res.text:
                     desc = res.text.strip()
-                    logger.debug(f"Gemini Flash Vision generated description ({len(desc)} chars) via '{attempt_model}'.")
+                    logger.debug(
+                        f"Gemini Flash Vision generated description ({len(desc)} chars) via '{attempt_model}'.")
                     return desc
             except Exception as e:
-                logger.warning(f"Gemini vision description attempt with '{attempt_model}' failed: {e}")
+                logger.warning(
+                    f"Gemini vision description attempt with '{attempt_model}' failed: {e}")
                 continue
 
     return ""
 
 
+@observe()
 class ExtractedImage(BaseModel):
     """Extracted image or visual element (figure, chart, picture, diagram)."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     index: int = Field(..., description="Order index of the extracted image")
-    caption: Optional[str] = Field(default=None, description="Caption or text accompanying the image")
-    label: Optional[str] = Field(default="picture", description="Element label (picture, chart, etc.)")
-    page_no: Optional[int] = Field(default=None, description="Page number where the image was found")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on page")
+    caption: Optional[str] = Field(
+        default=None, description="Caption or text accompanying the image")
+    label: Optional[str] = Field(
+        default="picture", description="Element label (picture, chart, etc.)")
+    page_no: Optional[int] = Field(
+        default=None, description="Page number where the image was found")
+    bbox: Optional[BoundingBox] = Field(
+        default=None, description="Bounding box on page")
     width: Optional[int] = Field(default=None, description="Image pixel width")
-    height: Optional[int] = Field(default=None, description="Image pixel height")
-    format: str = Field(default="PNG", description="Image format (PNG, JPEG, etc.)")
-    image: Optional[Image.Image] = Field(default=None, description="PIL Image instance")
+    height: Optional[int] = Field(
+        default=None, description="Image pixel height")
+    format: str = Field(
+        default="PNG", description="Image format (PNG, JPEG, etc.)")
+    image: Optional[Image.Image] = Field(
+        default=None, description="PIL Image instance")
     base64_uri: Optional[str] = Field(
         default=None, description="Base64 Data URI string (e.g. data:image/png;base64,...)"
     )
@@ -252,7 +248,8 @@ class ExtractedImage(BaseModel):
             return self.summary
 
         # Auto-describe using low-level Gemini Flash Vision if enabled
-        enable_vision = getattr(settings, "ENABLE_VISION_IMAGE_DESCRIPTION", True)
+        enable_vision = getattr(
+            settings, "ENABLE_VISION_IMAGE_DESCRIPTION", True)
         if use_vision and enable_vision and not self.description:
             img_source = self.image or self.saved_path
             if img_source is not None:
@@ -290,6 +287,7 @@ class ExtractedImage(BaseModel):
         raise ValueError("Cannot save image: PIL Image instance is None")
 
 
+@observe()
 class ExtractedTable(BaseModel):
     """Extracted structured table from the document."""
 
@@ -297,7 +295,8 @@ class ExtractedTable(BaseModel):
 
     index: int = Field(..., description="Order index of the table")
     markdown: str = Field(..., description="Table rendered as Markdown")
-    html: Optional[str] = Field(default=None, description="Table rendered as HTML")
+    html: Optional[str] = Field(
+        default=None, description="Table rendered as HTML")
     dataframe: Optional[pd.DataFrame] = Field(
         default=None, description="Pandas DataFrame representation"
     )
@@ -306,9 +305,12 @@ class ExtractedTable(BaseModel):
     )
     num_rows: int = Field(default=0, description="Number of table rows")
     num_cols: int = Field(default=0, description="Number of table columns")
-    caption: Optional[str] = Field(default=None, description="Caption accompanying the table")
-    page_no: Optional[int] = Field(default=None, description="Page number of the table")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on the page")
+    caption: Optional[str] = Field(
+        default=None, description="Caption accompanying the table")
+    page_no: Optional[int] = Field(
+        default=None, description="Page number of the table")
+    bbox: Optional[BoundingBox] = Field(
+        default=None, description="Bounding box on the page")
     table_image: Optional[ExtractedImage] = Field(
         default=None, description="Visual crop of the table if enabled"
     )
@@ -335,34 +337,43 @@ class ExtractedTable(BaseModel):
 
         if cols:
             parts.append(f"Columns: {', '.join(cols)}.")
-        parts.append(f"Dimensions: {self.num_rows} rows by {self.num_cols} columns.")
+        parts.append(
+            f"Dimensions: {self.num_rows} rows by {self.num_cols} columns.")
 
         sample_items = []
         if self.data_rows and len(self.data_rows) > 1:
             for r in self.data_rows[1:4]:
-                sample_items.append(" | ".join(str(val) for val in r if str(val).strip()))
+                sample_items.append(" | ".join(str(val)
+                                    for val in r if str(val).strip()))
         elif self.dataframe is not None and not self.dataframe.empty:
             for _, row in self.dataframe.head(3).iterrows():
-                sample_items.append(" | ".join(str(val) for val in row.values if str(val).strip()))
+                sample_items.append(" | ".join(str(val)
+                                    for val in row.values if str(val).strip()))
 
         if sample_items:
             parts.append(f"Sample data entries: {'; '.join(sample_items)}.")
 
-        summary_val = " ".join(parts).strip() or "Structured table containing data."
+        summary_val = " ".join(parts).strip(
+        ) or "Structured table containing data."
         self.summary = summary_val
         return summary_val
 
 
+@observe()
 class ExtractedFormula(BaseModel):
     """Extracted mathematical formula or equation formatted in LaTeX."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     index: int = Field(..., description="Order index of the formula")
-    latex: str = Field(..., description="Raw LaTeX formula string (e.g. $E=mc^2$ or display math)")
-    context: Optional[str] = Field(default=None, description="Surrounding contextual text or heading")
-    page_no: Optional[int] = Field(default=None, description="Page number where formula appears")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box on page")
+    latex: str = Field(...,
+                       description="Raw LaTeX formula string (e.g. $E=mc^2$ or display math)")
+    context: Optional[str] = Field(
+        default=None, description="Surrounding contextual text or heading")
+    page_no: Optional[int] = Field(
+        default=None, description="Page number where formula appears")
+    bbox: Optional[BoundingBox] = Field(
+        default=None, description="Bounding box on page")
     summary: Optional[str] = Field(
         default=None, description="Semantic summary for vector search embedding"
     )
@@ -388,28 +399,39 @@ class DocumentElement(BaseModel):
     type: Literal["heading", "text", "list_item", "code", "formula", "table", "picture", "other"] = (
         Field(..., description="Type of document element")
     )
-    text: str = Field(..., description="Extracted text or content of the element")
-    level: Optional[int] = Field(default=None, description="Heading level if applicable")
+    text: str = Field(...,
+                      description="Extracted text or content of the element")
+    level: Optional[int] = Field(
+        default=None, description="Heading level if applicable")
     page_no: Optional[int] = Field(default=None, description="Page number")
-    bbox: Optional[BoundingBox] = Field(default=None, description="Bounding box")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional item metadata")
+    bbox: Optional[BoundingBox] = Field(
+        default=None, description="Bounding box")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict, description="Additional item metadata")
 
 
+@observe()
 class MultimodalDocument(BaseModel):
     """Comprehensive container for a multi-modal document extracted with Docling."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    file_path: Optional[str] = Field(default=None, description="Source file path or URL")
+    file_path: Optional[str] = Field(
+        default=None, description="Source file path or URL")
     file_name: str = Field(..., description="Source file name")
-    file_extension: str = Field(..., description="File extension (e.g. .pdf, .png)")
-    file_size_bytes: Optional[int] = Field(default=None, description="Source file size in bytes")
-    mime_type: Optional[str] = Field(default=None, description="Detected MIME type")
-    num_pages: int = Field(default=1, description="Number of pages in the document")
+    file_extension: str = Field(...,
+                                description="File extension (e.g. .pdf, .png)")
+    file_size_bytes: Optional[int] = Field(
+        default=None, description="Source file size in bytes")
+    mime_type: Optional[str] = Field(
+        default=None, description="Detected MIME type")
+    num_pages: int = Field(
+        default=1, description="Number of pages in the document")
     markdown_content: str = Field(
         default="", description="Full document content formatted as Markdown"
     )
-    plain_text: str = Field(default="", description="Full document plain text content")
+    plain_text: str = Field(
+        default="", description="Full document plain text content")
     elements: List[DocumentElement] = Field(
         default_factory=list, description="Extracted elements in reading order"
     )
@@ -510,6 +532,7 @@ class MultimodalDocument(BaseModel):
 # ==============================================================================
 
 
+@observe()
 def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     """Convert a PIL Image to a Base64 Data URI string."""
     buffer = io.BytesIO()
@@ -522,6 +545,7 @@ def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
+@observe()
 def _extract_bbox_from_prov(item: Any) -> tuple[Optional[int], Optional[BoundingBox]]:
     """Extract page number and bounding box coordinates from item provenance."""
     page_no: Optional[int] = None
@@ -542,6 +566,7 @@ def _extract_bbox_from_prov(item: Any) -> tuple[Optional[int], Optional[Bounding
     return page_no, bbox
 
 
+@observe()
 def build_docling_converter(
     do_ocr: bool = True,
     do_table_structure: bool = True,
@@ -567,11 +592,120 @@ def build_docling_converter(
     return DocumentConverter(format_options=format_options)
 
 
+@observe()
+def _load_markdown_fallback(
+    path: Path,
+    file_name: str,
+    file_ext: str,
+    file_size: Optional[int],
+    mime_type: Optional[str],
+) -> MultimodalDocument:
+    """Resilient fallback parser for markdown files (.md, .markdown) if converter encounters issues."""
+    with _logfire_span(
+        "loader.load_markdown_fallback",
+        file_name=file_name,
+        file_path=str(path),
+        file_size_bytes=file_size,
+        file_extension=file_ext,
+        mime_type=mime_type or "text/markdown",
+    ) as span:
+        try:
+            raw_text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.error(f"Failed to read markdown file {path}: {e}")
+            span.record_exception(e)
+            raise
+
+        elements: List[DocumentElement] = []
+        lines = raw_text.splitlines()
+        for idx, line in enumerate(lines):
+            line_s = line.strip()
+            if not line_s:
+                continue
+            if line_s.startswith("#"):
+                level = len(line_s) - len(line_s.lstrip("#"))
+                elements.append(
+                    DocumentElement(
+                        index=idx,
+                        type="heading",
+                        text=line_s.lstrip("#").strip(),
+                        page_no=1,
+                        metadata={"level": level},
+                    )
+                )
+            elif line_s.startswith(("- ", "* ", "+ ")) or (
+                len(line_s) > 2 and line_s[:1].isdigit(
+                ) and line_s[1:3] in {". ", ") "}
+            ):
+                elements.append(
+                    DocumentElement(
+                        index=idx,
+                        type="list_item",
+                        text=line_s,
+                        page_no=1,
+                    )
+                )
+            else:
+                elements.append(
+                    DocumentElement(
+                        index=idx,
+                        type="text",
+                        text=line_s,
+                        page_no=1,
+                    )
+                )
+
+        raw_chars = len(raw_text)
+        est_tokens = max(1, max(int(len(raw_text.split()) * 1.3), raw_chars // 4)) if raw_chars > 0 else 0
+        span.set_attributes({
+            "num_elements": len(elements),
+            "num_lines": len(lines),
+            "content_length_chars": raw_chars,
+            "raw_text_chars": raw_chars,
+            "estimated_tokens": est_tokens,
+            "file_extension": file_ext,
+            "parser": "markdown_fallback_parser",
+        })
+
+        logger.info(
+            f"[Logfire] Fallback markdown parsing completed for '{file_name}': "
+            f"{len(elements)} elements extracted, ~{est_tokens} estimated tokens."
+        )
+
+        return MultimodalDocument(
+            file_path=str(path),
+            file_name=file_name,
+            file_extension=file_ext,
+            file_size_bytes=file_size,
+            mime_type=mime_type or "text/markdown",
+            num_pages=1,
+            markdown_content=raw_text,
+            plain_text=raw_text,
+            elements=elements,
+            tables=[],
+            images=[],
+            formulas=[],
+            metadata={
+                "num_pages": 1,
+                "num_elements": len(elements),
+                "num_tables": 0,
+                "num_images": 0,
+                "file_extension": file_ext,
+                "mime_type": mime_type or "text/markdown",
+                "raw_text_chars": raw_chars,
+                "estimated_tokens": est_tokens,
+                "parser": "markdown_fallback_parser",
+            },
+            raw_document=None,
+        )
+
+
 # ==============================================================================
 # MAIN MULTIMODAL LOADER FUNCTION
 # ==============================================================================
 
 
+@observe()
 def load_file(
     file_path: Union[str, Path],
     extract_images: bool = True,
@@ -629,7 +763,8 @@ def load_file(
         mime_type, _ = mimetypes.guess_type(file_name)
         source = file_path
 
-    logger.info(f"Loading multimodal document from {source} (type: {file_ext})")
+    logger.info(
+        f"Loading multimodal document from {source} (type: {file_ext})")
 
     # Quick fallback for standard plain text files without requiring Docling converter
     if path is not None and file_ext in {".txt", ".text", ".log", ".json", ".yaml", ".yml"}:
@@ -665,6 +800,8 @@ def load_file(
                 "num_images": 0,
                 "file_extension": file_ext,
                 "mime_type": mime_type or "text/plain",
+                "raw_text_chars": len(raw_text),
+                "estimated_tokens": max(1, max(int(len(raw_text.split()) * 1.3), len(raw_text) // 4)) if raw_text else 0,
             },
             raw_document=None,
         )
@@ -691,7 +828,12 @@ def load_file(
         doc: DoclingDocument = conversion_result.document
     except Exception as e:
         logger.error(f"Docling conversion failed for {source}: {e}")
-        raise RuntimeError(f"Failed to extract document content from {source}: {e}") from e
+        if path is not None and file_ext in {".md", ".markdown", ".mdown", ".mkd"}:
+            logger.info(
+                f"Falling back to resilient native markdown parser for {source}")
+            return _load_markdown_fallback(path, file_name, file_ext, file_size, mime_type)
+        raise RuntimeError(
+            f"Failed to extract document content from {source}: {e}") from e
 
     # Extract overall markdown and text
     markdown_content = doc.export_to_markdown()
@@ -772,7 +914,8 @@ def load_file(
             try:
                 table_md = table_item.export_to_markdown(doc)
             except Exception as e:
-                logger.warning(f"Failed to export table {idx} to markdown: {e}")
+                logger.warning(
+                    f"Failed to export table {idx} to markdown: {e}")
                 table_md = ""
 
             # HTML export
@@ -794,7 +937,8 @@ def load_file(
                     # Include header + rows for clean serialization
                     data_rows = [list(df.columns)] + df.values.tolist()
             except Exception as e:
-                logger.debug(f"DataFrame export for table {idx} failed or not supported: {e}")
+                logger.debug(
+                    f"DataFrame export for table {idx} failed or not supported: {e}")
 
             # Caption
             caption: Optional[str] = None
@@ -870,7 +1014,8 @@ def load_file(
             try:
                 pil_img = pic_item.get_image(doc)
             except Exception as e:
-                logger.debug(f"Could not extract PIL image for picture {idx}: {e}")
+                logger.debug(
+                    f"Could not extract PIL image for picture {idx}: {e}")
 
             b64_uri: Optional[str] = None
             saved_path: Optional[str] = None
@@ -884,7 +1029,8 @@ def load_file(
                     try:
                         b64_uri = image_to_base64(pil_img, format="PNG")
                     except Exception as e:
-                        logger.debug(f"Base64 conversion failed for picture {idx}: {e}")
+                        logger.debug(
+                            f"Base64 conversion failed for picture {idx}: {e}")
 
                 if target_img_dir is not None:
                     img_file = target_img_dir / f"image_{idx + 1}.png"
@@ -892,7 +1038,8 @@ def load_file(
                         pil_img.save(img_file)
                         saved_path = str(img_file.resolve())
                     except Exception as e:
-                        logger.warning(f"Failed to save image {idx} to {img_file}: {e}")
+                        logger.warning(
+                            f"Failed to save image {idx} to {img_file}: {e}")
 
             annotations: List[str] = []
             try:
@@ -926,7 +1073,8 @@ def load_file(
                 with Image.open(path) as raw_img:
                     raw_copy = raw_img.copy()
                     b64_uri = (
-                        image_to_base64(raw_copy, format=raw_copy.format or "PNG")
+                        image_to_base64(
+                            raw_copy, format=raw_copy.format or "PNG")
                         if include_base64_images
                         else None
                     )
@@ -970,7 +1118,8 @@ def load_file(
 
     # B) Regex scan markdown content for LaTeX blocks ($$ ... $$ or \[ ... \]) if not captured by docling
     if len(extracted_formulas) == 0 and markdown_content:
-        latex_matches = re.finditer(r"\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]", markdown_content)
+        latex_matches = re.finditer(
+            r"\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]", markdown_content)
         for m in latex_matches:
             f_text = (m.group(1) or m.group(2) or "").strip()
             if f_text:
@@ -1002,6 +1151,8 @@ def load_file(
             num_pages = max(1, len(doc.pages))
     except Exception:
         num_pages = 1
+    raw_chars = len(markdown_content or plain_text or "")
+    est_tokens = max(1, max(int(len((markdown_content or plain_text).split()) * 1.3), raw_chars // 4)) if raw_chars > 0 else 0
     metadata: Dict[str, Any] = {
         "num_pages": num_pages,
         "num_elements": len(elements),
@@ -1010,12 +1161,14 @@ def load_file(
         "num_formulas": len(extracted_formulas),
         "file_extension": file_ext,
         "mime_type": mime_type,
+        "raw_text_chars": raw_chars,
+        "estimated_tokens": est_tokens,
     }
 
     logger.info(
         f"Successfully loaded '{file_name}': {len(elements)} elements, "
         f"{len(extracted_tables)} tables, {len(extracted_images)} images, "
-        f"{len(extracted_formulas)} formulas, {num_pages} pages."
+        f"{len(extracted_formulas)} formulas, {num_pages} pages, ~{est_tokens} estimated tokens."
     )
 
     return MultimodalDocument(
@@ -1046,6 +1199,7 @@ load_multimodal_document = load_file
 # ==============================================================================
 
 
+@observe()
 def scan_directory(
     directory_path: Union[str, Path],
     recursive: bool = True,
@@ -1063,10 +1217,12 @@ def scan_directory(
     """
     root = Path(directory_path).resolve()
     if not root.exists() or not root.is_dir():
-        logger.warning(f"Scan directory does not exist or is not a directory: {root}")
+        logger.warning(
+            f"Scan directory does not exist or is not a directory: {root}")
         return []
 
-    target_exts = {e.lower() for e in (extensions or SUPPORTED_DOCUMENT_EXTENSIONS)}
+    target_exts = {e.lower()
+                   for e in (extensions or SUPPORTED_DOCUMENT_EXTENSIONS)}
     matched_files: List[Path] = []
 
     pattern = "**/*" if recursive else "*"
@@ -1081,6 +1237,7 @@ def scan_directory(
     return matched_files
 
 
+@observe()
 def load_directory(
     directory_path: Union[str, Path],
     recursive: bool = True,
@@ -1105,14 +1262,15 @@ def load_directory(
         directory=str(directory_path),
         recursive=recursive,
     ):
-        files = scan_directory(directory_path, recursive=recursive, extensions=extensions)
+        files = scan_directory(
+            directory_path, recursive=recursive, extensions=extensions)
         for file_path in files:
             try:
                 doc = load_file(file_path, **load_kwargs)
                 yield doc
             except Exception as e:
                 if ignore_errors:
-                    logger.warning(f"Skipping failed document '{file_path}': {e}")
+                    logger.warning(
+                        f"Skipping failed document '{file_path}': {e}")
                     continue
                 raise
-

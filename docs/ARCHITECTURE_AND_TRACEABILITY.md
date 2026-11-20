@@ -266,21 +266,70 @@ flowchart TD
 
 | File / Component | Type | Responsibility & Enhancements |
 |---|---|---|
-| [.env](file:///c:/llm/RAG/.env) | Environment | Configured `QDRANT_COLLECTION = dyxi_stag`. |
-| [app/config.py](file:///c:/llm/RAG/app/config.py) | Configuration | Set default `QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dyxi_stag")`; added vision models (`gemini-flash-latest`, fallback `gemini-3.1-flash-lite`); configured MySQL and Logfire settings. |
-| [app/ingestion/processor.py](file:///c:/llm/RAG/app/ingestion/processor.py) | Ingestion & Retrieval Pipeline | Added `MySQLMetadataManager.wipe_all_data()`; added `QdrantVectorManager.wipe_collection()`; implemented `wipe_all_storage()`; updated `ingest_directory()` with `sub_dir`, `max_files`, and `wipe` parameters; added CLI flags `--wipe`, `--sub-dir`, `--max-files`, and `--collection dyxi_stag`. |
+| [.env](file:///c:/llm/RAG/.env) | Environment | Centralized source of truth for all API keys, Qdrant settings (`dyxi_stag`), MySQL credentials, relational table names, embedding & vision model configurations, chunking thresholds, and observability tokens. |
+| [app/config.py](file:///c:/llm/RAG/app/config.py) | Configuration | Exposes strongly-typed `Settings` singleton parsing `.env` with URL-safe credential escaping (`urllib.parse.quote_plus`), dynamic table names (`TABLE_NAME_DOCUMENTS`, `TABLE_NAME_TABLES`, etc.), and fallback defaults. |
+| [app/ingestion/processor.py](file:///c:/llm/RAG/app/ingestion/processor.py) | Ingestion & Retrieval Pipeline | Dynamically binds SQLAlchemy models to table names defined in `settings`; added `MySQLMetadataManager.wipe_all_data()`; added `QdrantVectorManager.wipe_collection()`; implemented `wipe_all_storage()`; added CLI flags `--wipe`, `--sub-dir`, `--max-files`, and `--collection dyxi_stag`. |
 | [app/ingestion/loader/load.py](file:///c:/llm/RAG/app/ingestion/loader/load.py) | Document Loader | Added `describe_image_with_gemini()` using Gemini Flash Vision; enhanced `ExtractedImage` with AI visual `description` and updated `generate_summary()`; added `ExtractedFormula` Pydantic model; enhanced `ExtractedTable` with semantic schema summary generation. |
 | [app/ingestion/chunking/chunker.py](file:///c:/llm/RAG/app/ingestion/chunking/chunker.py) | Chunker | Implemented `HybridChunker` with hierarchical heading contextualization and native zero-dependency `GeminiTokenEstimator`. |
 | [app/services/retreival/embeddings.py](file:///c:/llm/RAG/app/services/retreival/embeddings.py) | Embeddings | Primary `gemini-embedding-2` with MRL truncation (768-dim) and automatic fallout to `jina-embeddings-v4`. |
 | [app/ingestion/__init__.py](file:///c:/llm/RAG/app/ingestion/__init__.py) | Package Exports | Exported `wipe_all_storage`, `ingest_file`, `ingest_directory`, `retrieve_similar_chunks`. |
-| [scripts/setup_database.sh](file:///c:/llm/RAG/scripts/setup_database.sh) | Bash Automation Script | Automated shell script to create `rag_metadata` database and all relational lookup tables via `mysql` CLI or Python fallback with `.env` auto-loading and CLI flags. |
+| [scripts/setup_database.sh](file:///c:/llm/RAG/scripts/setup_database.sh) | Bash Automation Script | Automated shell script to create `rag_metadata` database and all relational lookup tables via `mysql` CLI or Python fallback with `.env` auto-loading, dynamic table name substitutions, and CLI flags. |
 | [scripts/setup_database.ps1](file:///c:/llm/RAG/scripts/setup_database.ps1) | PowerShell Automation Script | Windows native PowerShell equivalent script for database and table initialization. |
 | [scripts/init_schema.sql](file:///c:/llm/RAG/scripts/init_schema.sql) | Relational DDL Script | Idempotent MySQL DDL defining `rag_document_metadata`, `rag_extracted_tables`, `rag_extracted_images` (with AI vision descriptions), and `rag_extracted_formulas`. |
-| [scripts/init_db.py](file:///c:/llm/RAG/scripts/init_db.py) | Universal Python Helper | Cross-platform multi-statement SQL execution runner using `pymysql` with connection validation and table status reporting. |
+| [scripts/init_db.py](file:///c:/llm/RAG/scripts/init_db.py) | Universal Python Helper | Cross-platform multi-statement SQL execution runner using `pymysql` with dynamic table name replacements from `.env` and status reporting. |
 
 ---
 
-## 5. Relational Database Initialization & Bash Automation Script
+## 5. Centralized Configuration & Environment Variables (`.env`)
+
+All operational credentials, database parameters, constant table names, model tiers, and chunking heuristics are managed in [.env](file:///c:/llm/RAG/.env) and loaded uniformly into Python via [app/config.py](file:///c:/llm/RAG/app/config.py):
+
+| Group | Key | Default / Value | Description |
+|---|---|---|---|
+| **API Keys & Gateways** | `GEMINI_API_KEY` | *(Set)* | Primary multimodal & embedding key |
+| | `OPENAI_API_KEY` | *(Set)* | OpenAI models key |
+| | `ANTHROPIC_API_KEY` | *(Set)* | Anthropic models key |
+| | `GROQ_API_KEY` | `""` | Groq Llama 3.3 engine |
+| | `JINA_API_KEY` | `""` | Fallout multimodal embedding model |
+| **Qdrant Vector DB** | `QDRANT_COLLECTION` | `dyxi_stag` | Target vector collection name |
+| | `QDRANT_CLUSTER_ENDPOINT` | *(GCP Cloud)* | Managed Qdrant cluster endpoint |
+| | `QDRANT_LOCAL_PATH` | `./qdrant_storage` | Local offline storage fallback directory |
+| | `QDRANT_TIMEOUT_SECONDS` | `30.0` | Client network timeout |
+| | `QDRANT_DISTANCE_METRIC` | `Cosine` | Vector distance metric |
+| **MySQL Relational DB** | `MYSQL_HOST` | `localhost` | MySQL host address |
+| | `MYSQL_PORT` | `3306` | MySQL listening port |
+| | `MYSQL_USER` | `root` | Database administrative username |
+| | `MYSQL_PASSWORD` | `Oluwaseun1@` | Database user password (URL-encoded in SQLAlchemy) |
+| | `MYSQL_DATABASE` | `rag_metadata` | Primary relational database name |
+| | `SQLITE_FALLBACK_URL` | `sqlite:///...` | Resilience fallback when MySQL is down |
+| **Configurable Table Names** | `TABLE_NAME_DOCUMENTS` | `rag_document_metadata` | Master document records table |
+| | `TABLE_NAME_TABLES` | `rag_extracted_tables` | Full intact Markdown tables store |
+| | `TABLE_NAME_IMAGES` | `rag_extracted_images` | AI visual descriptions & base64 store |
+| | `TABLE_NAME_FORMULAS` | `rag_extracted_formulas` | Raw LaTeX math equations store |
+| **Embedding Models** | `PRIMARY_EMBEDDING_MODEL` | `gemini-embedding-2` | Dense asymmetric vector embedder |
+| | `FALLBACK_EMBEDDING_MODEL` | `jina-embeddings-v4` | Automatic failover embedder |
+| | `EMBEDDING_DIMENSION` | `768` | Uniform vector output dimension |
+| | `EMBEDDING_RPM_LIMIT` | `600` | Token bucket request rate ceiling |
+| | `EMBEDDING_BATCH_SIZE` | `32` | Number of items per embedding request |
+| | `USE_FALLOUT_MODEL` | `false` | Explicitly force fallout embedder |
+| **Vision Models** | `GEMINI_VISION_MODEL` | `gemini-flash-latest` | Primary image description vision model |
+| | `FALLBACK_VISION_MODEL` | `gemini-3.1-flash-lite`| Fallback image vision model |
+| | `ENABLE_VISION_IMAGE_DESCRIPTION` | `true` | Automated visual description toggle |
+| | `VISION_MAX_OUTPUT_TOKENS` | `150` | Output token cap for image descriptions |
+| | `VISION_TEMPERATURE` | `0.2` | Vision sampling temperature |
+| **Ingestion Constants** | `DATA_DIR` | `DATA` | Document source directory |
+| | `CHUNK_MAX_TOKENS` | `1200` | Max tokens per chunk block |
+| | `CHUNK_MERGE_PEERS` | `true` | Merge small peer DOM elements |
+| | `PDF_PAGE_BATCH_SIZE` | `30` | Bounded batch page streaming limit |
+| | `RETRIEVAL_TOP_K` | `5` | Top results to return during retrieval |
+| **Observability** | `LOGFIRE_TOKEN` | *(Configured)* | Pydantic Logfire telemetry token |
+| | `LOGFIRE_INGESTION_SERVICE_NAME` | `rag-ingestion-service` | Ingestion tracer service name |
+| | `LOGFIRE_EMBEDDINGS_SERVICE_NAME`| `rag-embeddings-service`| Embedding tracer service name |
+| | `LANGSMITH_TRACING` | `true` | LangChain tracing toggle |
+
+---
+
+## 6. Relational Database Initialization & Bash Automation Script
 
 To guarantee that the relational lookup store is properly provisioned before ingestion begins, the system provides automated setup scripts that create the database and all required tables with optimal indices and UTF8MB4 collation.
 
@@ -355,9 +404,9 @@ python scripts/init_db.py -H localhost -P 3306 -u root -p "my_secure_password"
 
 ---
 
-## 6. Usage Examples
+## 7. Usage Examples
 
-### 6.1 Command Line Interface (CLI)
+### 7.1 Command Line Interface (CLI)
 
 #### 1. Setup MySQL Database and Tables
 ```bash
@@ -400,7 +449,7 @@ python -m app.ingestion.processor --file DATA/test_quantum_report.md --query "Wh
 
 ---
 
-### 6.2 Programmatic Python Usage
+### 7.2 Programmatic Python Usage
 
 #### Clean Wipe & Re-Ingest Targeted Subdirectory
 
@@ -445,7 +494,7 @@ for hit in hits:
 
 ---
 
-## 7. Verified End-to-End Test Output
+## 8. Verified End-to-End Test Output
 
 ```text
 ================================================================================
@@ -471,7 +520,7 @@ VERIFIED WIPE, SUBDIRECTORY, AND BATCH RETRIEVAL OUTPUT
 
 ---
 
-## 8. Resilience & Fallback Guarantees
+## 9. Resilience & Fallback Guarantees
 
 1. **MySQL Daemon Outage Fallback**:
   If the MySQL instance on port 3306 is down or credentials fail, `MySQLMetadataManager` logs a warning and automatically falls back to local SQLite (`sqlite:///rag_nontextual_metadata.db`).

@@ -80,55 +80,22 @@ from app.services.retreival.embeddings import (
 # LOGFIRE OBSERVABILITY CONFIGURATION (INGESTION SERVICE)
 # ==============================================================================
 
+from app.observability import (
+    instrument_sqlalchemy_engine,
+    observe,
+    observe_block,
+    setup_observability,
+)
+
 # LangChain tracing suppression when API key is missing
 if not os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
-INGESTION_SERVICE_NAME = getattr(
-    settings, "LOGFIRE_INGESTION_SERVICE_NAME", "rag-ingestion-service"
-)
+# Global Logfire setup
+setup_observability()
 
-try:
-    import logfire
-
-    _logfire_token = getattr(settings, "LOGFIRE_TOKEN", None) or os.getenv("LOGFIRE_TOKEN")
-    logfire.configure(
-        send_to_logfire="if-token-present",
-        token=_logfire_token,
-        service_name=INGESTION_SERVICE_NAME,
-    )
-    try:
-        logger.add(**logfire.loguru_handler())
-    except Exception:
-        pass
-except ImportError:
-    logfire = None
-
-
-class _NoopSpan:
-    """No-op span placeholder for when Logfire is unavailable."""
-
-    def set_attribute(self, key: str, value: Any) -> None:
-        pass
-
-    def set_attributes(self, attributes: Dict[str, Any]) -> None:
-        pass
-
-    def record_exception(self, exception: BaseException) -> None:
-        pass
-
-
-_NOOP_SPAN = _NoopSpan()
-
-
-@contextlib.contextmanager
-def _logfire_span(name: str, **kwargs: Any):
-    """Context manager for Logfire distributed tracing and span telemetry."""
-    if logfire is not None:
-        with logfire.span(name, **kwargs) as span:
-            yield span
-    else:
-        yield _NOOP_SPAN
+# Use observe_block as the unified span provider with SUCCESS/FAILED tracking
+_logfire_span = observe_block
 
 
 # ==============================================================================
@@ -141,7 +108,7 @@ Base = declarative_base()
 class DocumentMetadataRecord(Base):
     """SQL table storing root document metadata and ingestion statistics."""
 
-    __tablename__ = "rag_document_metadata"
+    __tablename__ = settings.TABLE_NAME_DOCUMENTS
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     document_id = Column(String(128), unique=True, index=True, nullable=False)
@@ -165,7 +132,7 @@ class ExtractedTableRecord(Base):
     and the summary that was embedded into Qdrant for semantic search matching.
     """
 
-    __tablename__ = "rag_extracted_tables"
+    __tablename__ = settings.TABLE_NAME_TABLES
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     table_id = Column(String(128), unique=True, index=True, nullable=False)
@@ -186,7 +153,7 @@ class ExtractedTableRecord(Base):
 class ExtractedImageRecord(Base):
     """SQL lookup table storing non-textual visual data indexed by image_id."""
 
-    __tablename__ = "rag_extracted_images"
+    __tablename__ = settings.TABLE_NAME_IMAGES
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     image_id = Column(String(128), unique=True, index=True, nullable=False)
@@ -210,7 +177,7 @@ class ExtractedImageRecord(Base):
 class ExtractedFormulaRecord(Base):
     """SQL lookup table storing LaTeX-formatted formulas indexed by formula_id."""
 
-    __tablename__ = "rag_extracted_formulas"
+    __tablename__ = settings.TABLE_NAME_FORMULAS
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     formula_id = Column(String(128), unique=True, index=True, nullable=False)
@@ -229,6 +196,7 @@ class ExtractedFormulaRecord(Base):
 # ==============================================================================
 
 
+@observe()
 class MySQLMetadataManager:
     """Production manager for persisting complete, uncorrupted non-textual data in MySQL.
 
@@ -261,6 +229,7 @@ class MySQLMetadataManager:
                 conn.execute(sqlalchemy.text("SELECT 1"))
             self.engine = engine
             self.is_sqlite_fallback = False
+            instrument_sqlalchemy_engine(self.engine)
             logger.info("Successfully connected to MySQL database.")
         except Exception as e:
             logger.warning(
@@ -269,6 +238,7 @@ class MySQLMetadataManager:
             )
             self.engine = create_engine(self.sqlite_url)
             self.is_sqlite_fallback = True
+            instrument_sqlalchemy_engine(self.engine)
 
         # 2. Ensure schema tables exist
         try:
@@ -523,6 +493,7 @@ class VectorIndexEntry(BaseModel):
     payload: Dict[str, Any]
 
 
+@observe()
 class QdrantVectorManager:
     """Production manager for Qdrant vector database operations.
 
@@ -686,6 +657,7 @@ class QdrantVectorManager:
                 raise
 
 
+@observe()
 def wipe_all_storage(
     collection_name: Optional[str] = None,
     mysql_manager: Optional[MySQLMetadataManager] = None,
@@ -745,6 +717,11 @@ class FileIngestionSummary(BaseModel):
     model_used: str
     db_engine: str
     time_taken_seconds: float
+    total_tokens: int = Field(default=0, description="Total tokens consumed across all text chunks")
+    avg_tokens_per_chunk: float = Field(default=0.0, description="Average tokens per chunk")
+    total_embedded_tokens: int = Field(default=0, description="Total tokens embedded across all vectors")
+    throughput_chunks_per_sec: float = Field(default=0.0, description="Chunk generation throughput")
+    throughput_tokens_per_sec: float = Field(default=0.0, description="Token processing throughput")
 
 
 class DirectoryIngestionSummary(BaseModel):
@@ -761,6 +738,12 @@ class DirectoryIngestionSummary(BaseModel):
     total_vectors: int
     model_used: str
     duration_seconds: float
+    total_tokens: int = Field(default=0, description="Total tokens consumed across all files")
+    avg_tokens_per_chunk: float = Field(default=0.0, description="Average tokens per chunk across all files")
+    avg_tokens_per_file: float = Field(default=0.0, description="Average tokens per file")
+    total_embedded_tokens: int = Field(default=0, description="Total tokens embedded across all vectors")
+    throughput_chunks_per_sec: float = Field(default=0.0, description="Overall chunks processed per second")
+    throughput_tokens_per_sec: float = Field(default=0.0, description="Overall tokens processed per second")
     file_summaries: List[FileIngestionSummary] = Field(default_factory=list)
     errors: Dict[str, str] = Field(default_factory=dict)
 
@@ -770,6 +753,7 @@ class DirectoryIngestionSummary(BaseModel):
 # ==============================================================================
 
 
+@observe()
 class LangChainIngestionWorkflow:
     """Production LangChain LCEL workflow for Summary-Indexed document ingestion.
 
@@ -838,7 +822,11 @@ class LangChainIngestionWorkflow:
             max_tokens=self.max_tokens,
             merge_peers=True,
         )
+        total_tokens = sum(c.metadata.num_tokens or 0 for c in chunks)
+        avg_tokens = round(total_tokens / len(chunks), 2) if chunks else 0.0
         state["chunks"] = chunks
+        state["total_tokens"] = total_tokens
+        state["avg_tokens_per_chunk"] = avg_tokens
         return state
 
     def _embed_step(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -962,10 +950,15 @@ class LangChainIngestionWorkflow:
         else:
             vectors = []
 
+        from app.ingestion.chunking.chunker import GeminiTokenEstimator
+        estimator = GeminiTokenEstimator(max_tokens=self.max_tokens)
+        total_embedded_tokens = sum(estimator.count_tokens(entry.text_to_embed) for entry in entries_to_index)
+
         active_model = self.fallback_model if self.prefer_fallback else self.primary_model
         state["entries_to_index"] = entries_to_index
         state["embeddings"] = vectors
         state["model_used"] = active_model
+        state["total_embedded_tokens"] = total_embedded_tokens
         return state
 
     def _store_step(self, state: Dict[str, Any]) -> FileIngestionSummary:
@@ -976,6 +969,9 @@ class LangChainIngestionWorkflow:
         embeddings: List[List[float]] = state["embeddings"]
         model_used: str = state["model_used"]
         start_time: float = state["start_time"]
+        total_tokens: int = state.get("total_tokens", 0)
+        avg_tokens: float = state.get("avg_tokens_per_chunk", round(total_tokens / len(chunks), 2) if chunks else 0.0)
+        total_embedded_tokens: int = state.get("total_embedded_tokens", 0)
 
         logger.debug(f"[LangChain Workflow] Step 4: Storing '{doc.file_name}'...")
 
@@ -993,6 +989,9 @@ class LangChainIngestionWorkflow:
             )
 
         elapsed = time.time() - start_time
+        throughput_chunks = round(len(chunks) / elapsed, 2) if elapsed > 0 else 0.0
+        throughput_tokens = round(total_tokens / elapsed, 2) if elapsed > 0 else 0.0
+
         return FileIngestionSummary(
             file_path=state["file_path"],
             file_name=doc.file_name,
@@ -1005,6 +1004,11 @@ class LangChainIngestionWorkflow:
             model_used=model_used,
             db_engine=mysql_result["db_engine"],
             time_taken_seconds=round(elapsed, 2),
+            total_tokens=total_tokens,
+            avg_tokens_per_chunk=avg_tokens,
+            total_embedded_tokens=total_embedded_tokens,
+            throughput_chunks_per_sec=throughput_chunks,
+            throughput_tokens_per_sec=throughput_tokens,
         )
 
     def _build_chain(self):
@@ -1018,8 +1022,31 @@ class LangChainIngestionWorkflow:
 
     def invoke(self, file_path: Union[str, Path]) -> FileIngestionSummary:
         """Execute end-to-end ingestion on a single file through the LangChain pipeline."""
-        with _logfire_span("workflow.invoke", file_path=str(file_path)):
-            return self.chain.invoke(str(file_path))
+        with _logfire_span("workflow.invoke", file_path=str(file_path)) as span:
+            summary = self.chain.invoke(str(file_path))
+            span.set_attributes({
+                "ingestion.chunks_count": summary.chunks_count,
+                "ingestion.total_tokens": summary.total_tokens,
+                "ingestion.avg_tokens_per_chunk": summary.avg_tokens_per_chunk,
+                "ingestion.total_embedded_tokens": summary.total_embedded_tokens,
+                "ingestion.tables_count": summary.tables_count,
+                "ingestion.images_count": summary.images_count,
+                "ingestion.formulas_count": summary.formulas_count,
+                "ingestion.vectors_count": summary.vectors_count,
+                "ingestion.model_used": summary.model_used,
+                "ingestion.db_engine": summary.db_engine,
+                "ingestion.time_taken_seconds": summary.time_taken_seconds,
+                "ingestion.throughput_chunks_per_sec": summary.throughput_chunks_per_sec,
+                "ingestion.throughput_tokens_per_sec": summary.throughput_tokens_per_sec,
+            })
+            logger.info(
+                f"[Logfire] Ingested '{summary.file_name}': {summary.chunks_count} chunks created, "
+                f"{summary.total_tokens} tokens consumed (~{summary.avg_tokens_per_chunk:.1f} tok/chunk), "
+                f"{summary.vectors_count} vectors indexed in Qdrant ({summary.model_used}), "
+                f"{summary.tables_count} tables, {summary.images_count} images, {summary.formulas_count} formulas in MySQL "
+                f"in {summary.time_taken_seconds}s ({summary.throughput_tokens_per_sec:.1f} tokens/s)."
+            )
+            return summary
 
     def batch(self, file_paths: Sequence[Union[str, Path]]) -> List[FileIngestionSummary]:
         """Execute batch ingestion across multiple files using the LangChain pipeline."""
@@ -1032,6 +1059,7 @@ class LangChainIngestionWorkflow:
 # ==============================================================================
 
 
+@observe()
 def ingest_file(
     file_path: Union[str, Path],
     prefer_fallback: bool = False,
@@ -1049,6 +1077,7 @@ def ingest_file(
     return workflow.invoke(file_path)
 
 
+@observe()
 def ingest_directory(
     directory_path: Union[str, Path] = "DATA",
     sub_dir: Optional[str] = None,
@@ -1128,7 +1157,7 @@ def ingest_directory(
         recursive=recursive,
         prefer_fallback=prefer_fallback,
         service_name=INGESTION_SERVICE_NAME,
-    ):
+    ) as root_span:
         files = scan_directory(target_dir, recursive=recursive) if target_dir.exists() else []
         total_scanned = len(files)
 
@@ -1188,11 +1217,47 @@ def ingest_directory(
                     raise
 
         duration = round(time.time() - start_time, 2)
+        total_tokens = sum(s.total_tokens for s in summaries)
+        total_embedded_tokens = sum(s.total_embedded_tokens for s in summaries)
+        avg_tokens_per_chunk = round(total_tokens / total_chunks, 2) if total_chunks > 0 else 0.0
+        avg_tokens_per_file = round(total_tokens / len(summaries), 2) if summaries else 0.0
+        throughput_chunks = round(total_chunks / duration, 2) if duration > 0 else 0.0
+        throughput_tokens = round(total_tokens / duration, 2) if duration > 0 else 0.0
+
+        root_span.set_attributes({
+            "ingestion.total_files_scanned": total_scanned,
+            "ingestion.successful_files": len(summaries),
+            "ingestion.failed_files": len(errors),
+            "ingestion.total_chunks": total_chunks,
+            "ingestion.total_tokens_consumed": total_tokens,
+            "ingestion.total_embedded_tokens": total_embedded_tokens,
+            "ingestion.avg_tokens_per_chunk": avg_tokens_per_chunk,
+            "ingestion.avg_tokens_per_file": avg_tokens_per_file,
+            "ingestion.total_tables": total_tables,
+            "ingestion.total_images": total_images,
+            "ingestion.total_formulas": total_formulas,
+            "ingestion.total_vectors": total_vectors,
+            "ingestion.model_used": active_model,
+            "ingestion.qdrant_collection": active_col,
+            "ingestion.duration_seconds": duration,
+            "ingestion.throughput_chunks_per_sec": throughput_chunks,
+            "ingestion.throughput_tokens_per_sec": throughput_tokens,
+        })
+
         logger.info(
-            f"Directory ingestion completed in {duration}s: "
-            f"{len(summaries)} succeeded, {len(errors)} failed, "
-            f"{total_chunks} chunks, {total_tables} tables, {total_images} images, "
-            f"{total_formulas} formulas, {total_vectors} vectors."
+            f"[Logfire Ingestion Evaluation Report]\n"
+            f"====================================================================\n"
+            f"  Target Directory:        {target_dir}\n"
+            f"  Subdirectory Target:     {sub_dir or 'All'}\n"
+            f"  Files Processed:         {len(summaries)} succeeded, {len(errors)} failed (scanned {total_scanned})\n"
+            f"  Total Chunks Created:    {total_chunks}\n"
+            f"  Total Tokens Consumed:   {total_tokens} (avg {avg_tokens_per_chunk:.1f} tok/chunk, {avg_tokens_per_file:.1f} tok/file)\n"
+            f"  Total Embedded Tokens:   {total_embedded_tokens}\n"
+            f"  Structured Data (MySQL): {total_tables} tables, {total_images} images, {total_formulas} formulas\n"
+            f"  Vectors Indexed (Qdrant):{total_vectors} vectors in collection '{active_col}' ({active_model})\n"
+            f"  Total Duration:          {duration}s\n"
+            f"  Throughput:              {throughput_chunks:.2f} chunks/s, {throughput_tokens:.1f} tokens/s\n"
+            f"===================================================================="
         )
 
         return DirectoryIngestionSummary(
@@ -1207,6 +1272,12 @@ def ingest_directory(
             total_vectors=total_vectors,
             model_used=active_model,
             duration_seconds=duration,
+            total_tokens=total_tokens,
+            avg_tokens_per_chunk=avg_tokens_per_chunk,
+            avg_tokens_per_file=avg_tokens_per_file,
+            total_embedded_tokens=total_embedded_tokens,
+            throughput_chunks_per_sec=throughput_chunks,
+            throughput_tokens_per_sec=throughput_tokens,
             file_summaries=summaries,
             errors=errors,
         )
@@ -1217,6 +1288,7 @@ def ingest_directory(
 # ==============================================================================
 
 
+@observe()
 def retrieve_similar_chunks(
     query: str,
     top_k: int = 5,

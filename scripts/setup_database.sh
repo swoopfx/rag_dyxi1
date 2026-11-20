@@ -50,8 +50,14 @@ read_env_var() {
 DB_HOST=$(read_env_var "MYSQL_HOST" "localhost")
 DB_PORT=$(read_env_var "MYSQL_PORT" "3306")
 DB_USER=$(read_env_var "MYSQL_USER" "root")
-DB_PASS=$(read_env_var "MYSQL_PASSWORD" "")
+DB_PASS=$(read_env_var "MYSQL_PASSWORD" "Oluwaseun1@")
 DB_NAME=$(read_env_var "MYSQL_DATABASE" "rag_metadata")
+
+# Table names from .env
+TBL_DOCS=$(read_env_var "TABLE_NAME_DOCUMENTS" "rag_document_metadata")
+TBL_TABLES=$(read_env_var "TABLE_NAME_TABLES" "rag_extracted_tables")
+TBL_IMAGES=$(read_env_var "TABLE_NAME_IMAGES" "rag_extracted_images")
+TBL_FORMULAS=$(read_env_var "TABLE_NAME_FORMULAS" "rag_extracted_formulas")
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -128,13 +134,17 @@ fi
 if command -v mysql >/dev/null 2>&1; then
     echo -e "${BLUE}[*] Found native 'mysql' CLI client. Executing schema...${NC}"
     
-    MYSQL_CMD="mysql -h${DB_HOST} -P${DB_PORT} -u${DB_USER}"
     if [ -n "${DB_PASS}" ]; then
-        MYSQL_CMD="${MYSQL_CMD} -p${DB_PASS}"
+        export MYSQL_PWD="${DB_PASS}"
     fi
 
-    # Execute DDL
-    if eval "${MYSQL_CMD} < \"${SQL_FILE}\""; then
+    # Execute DDL with dynamic table and database substitutions
+    if sed -e "s/\`rag_metadata\`/\`${DB_NAME}\`/g" \
+           -e "s/\`rag_document_metadata\`/\`${TBL_DOCS}\`/g" \
+           -e "s/\`rag_extracted_tables\`/\`${TBL_TABLES}\`/g" \
+           -e "s/\`rag_extracted_images\`/\`${TBL_IMAGES}\`/g" \
+           -e "s/\`rag_extracted_formulas\`/\`${TBL_FORMULAS}\`/g" \
+           "${SQL_FILE}" | mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}"; then
         echo -e "${GREEN}[+] SQL statements executed successfully via mysql CLI.${NC}"
     else
         echo -e "${RED}[ERROR] Execution failed with mysql CLI.${NC}"
@@ -144,7 +154,7 @@ if command -v mysql >/dev/null 2>&1; then
     # Verify tables
     echo -e "${BLUE}[*] Verifying created tables in '${DB_NAME}'...${NC}"
     TABLES_QUERY="SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema='${DB_NAME}';"
-    eval "${MYSQL_CMD} -e \"${TABLES_QUERY}\""
+    mysql -h"${DB_HOST}" -P"${DB_PORT}" -u"${DB_USER}" -e "${TABLES_QUERY}"
 
     echo -e "${GREEN}========================================================================${NC}"
     echo -e "${BOLD}${GREEN}[SUCCESS] Database '${DB_NAME}' and tables initialized successfully!${NC}"

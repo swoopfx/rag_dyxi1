@@ -49,12 +49,20 @@ def load_config(args):
     
     sql_file = Path(args.file) if args.file else Path(__file__).resolve().parent / "init_schema.sql"
 
-    return host, port, user, password, database, sql_file
+    # Configurable Table Names from .env
+    tables = {
+        "documents": os.getenv("TABLE_NAME_DOCUMENTS", "rag_document_metadata"),
+        "tables": os.getenv("TABLE_NAME_TABLES", "rag_extracted_tables"),
+        "images": os.getenv("TABLE_NAME_IMAGES", "rag_extracted_images"),
+        "formulas": os.getenv("TABLE_NAME_FORMULAS", "rag_extracted_formulas"),
+    }
+
+    return host, port, user, password, database, sql_file, tables
 
 
 def init_database():
     args = parse_args()
-    host, port, user, password, database, sql_file = load_config(args)
+    host, port, user, password, database, sql_file, tables = load_config(args)
 
     if not sql_file.exists():
         print(f"[ERROR] SQL schema file not found at: {sql_file}")
@@ -67,6 +75,8 @@ def init_database():
     print(f" Target User:     {user}")
     print(f" Target Database: {database}")
     print(f" SQL File:        {sql_file}")
+    print(f" Tables Config:   docs={tables['documents']}, tables={tables['tables']}")
+    print(f"                  images={tables['images']}, formulas={tables['formulas']}")
     print("-" * 70)
 
     try:
@@ -83,10 +93,17 @@ def init_database():
         )
         print("[+] Server connection established successfully.")
 
-        # Step 2: Read and execute SQL statements
+        # Step 2: Read and execute SQL statements with dynamic table name replacements
         print(f"[*] Reading schema script: {sql_file.name}...")
         with open(sql_file, "r", encoding="utf-8") as f:
             sql_script = f.read()
+
+        # Dynamic replacements from .env
+        sql_script = sql_script.replace("`rag_metadata`", f"`{database}`")
+        sql_script = sql_script.replace("`rag_document_metadata`", f"`{tables['documents']}`")
+        sql_script = sql_script.replace("`rag_extracted_tables`", f"`{tables['tables']}`")
+        sql_script = sql_script.replace("`rag_extracted_images`", f"`{tables['images']}`")
+        sql_script = sql_script.replace("`rag_extracted_formulas`", f"`{tables['formulas']}`")
 
         print("[*] Executing database and table creation DDL...")
         with conn.cursor() as cursor:
@@ -97,12 +114,12 @@ def init_database():
         with conn.cursor() as cursor:
             cursor.execute(f"USE `{database}`;")
             cursor.execute("SHOW TABLES;")
-            tables = [row[0] for row in cursor.fetchall()]
+            found_tables = [row[0] for row in cursor.fetchall()]
 
         print("-" * 70)
         print(f"[SUCCESS] Database `{database}` initialized successfully.")
-        print(f"[+] Verified Tables in `{database}` ({len(tables)} tables):")
-        for table in tables:
+        print(f"[+] Verified Tables in `{database}` ({len(found_tables)} tables):")
+        for table in found_tables:
             with conn.cursor() as cursor:
                 cursor.execute(f"SELECT COUNT(*) FROM `{table}`;")
                 count = cursor.fetchone()[0]
