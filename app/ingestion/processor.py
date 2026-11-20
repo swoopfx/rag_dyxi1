@@ -490,6 +490,29 @@ class MySQLMetadataManager:
                 "page_no": record.page_no,
             }
 
+    def wipe_all_data(self) -> Dict[str, int]:
+        """Wipe all extracted tables, formulas, images, and document metadata from MySQL/SQLite.
+
+        Returns:
+            Dictionary with deletion counts per table.
+        """
+        with _logfire_span("mysql.wipe_all_data"):
+            with self.get_session() as session:
+                num_tables = session.query(ExtractedTableRecord).delete()
+                num_formulas = session.query(ExtractedFormulaRecord).delete()
+                num_images = session.query(ExtractedImageRecord).delete()
+                num_docs = session.query(DocumentMetadataRecord).delete()
+            logger.warning(
+                f"Wiped all non-textual data from relational database: {num_docs} document(s), "
+                f"{num_tables} table(s), {num_formulas} formula(s), {num_images} image(s)."
+            )
+            return {
+                "documents_deleted": num_docs,
+                "tables_deleted": num_tables,
+                "formulas_deleted": num_formulas,
+                "images_deleted": num_images,
+            }
+
 
 class VectorIndexEntry(BaseModel):
     """An individual entry to be vectorized and indexed in Qdrant."""
@@ -516,7 +539,11 @@ class QdrantVectorManager:
     ):
         self.endpoint = endpoint or settings.QDRANT_CLUSTER_ENDPOINT
         self.api_key = api_key or settings.QDRANT_API_KEY
-        self.collection_name = default_collection or settings.QDRANT_COLLECTION or "dyxi_rag"
+        self.collection_name = (
+            default_collection
+            or getattr(settings, "QDRANT_COLLECTION", "dyxi_stag")
+            or "dyxi_stag"
+        )
         self.client = self._init_client()
 
     def _init_client(self) -> QdrantClient:
@@ -626,6 +653,77 @@ class QdrantVectorManager:
 
             logger.info(f"Upserted {total_upserted} vectors into Qdrant collection '{col}'.")
             return total_upserted
+
+    def wipe_collection(
+        self,
+        collection_name: Optional[str] = None,
+        vector_size: int = DEFAULT_DIMENSION,
+        distance: Distance = Distance.COSINE,
+    ) -> bool:
+        """Delete and recreate target collection in Qdrant, completely wiping all points.
+
+        Args:
+            collection_name: Target Qdrant collection name (default: self.collection_name).
+            vector_size: Dimensionality for recreated collection.
+            distance: Vector distance metric.
+
+        Returns:
+            True if collection was wiped and recreated.
+        """
+        col = collection_name or self.collection_name
+        with _logfire_span("qdrant.wipe_collection", collection=col):
+            try:
+                collections = [c.name for c in self.client.get_collections().collections]
+                if col in collections:
+                    logger.warning(f"Deleting existing Qdrant collection '{col}' for clean re-install...")
+                    self.client.delete_collection(collection_name=col)
+                # Re-create empty collection with proper configuration
+                self.ensure_collection(collection_name=col, vector_size=vector_size, distance=distance)
+                logger.info(f"Successfully wiped and re-created empty Qdrant collection '{col}'.")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to wipe/recreate Qdrant collection '{col}': {e}")
+                raise
+
+
+def wipe_all_storage(
+    collection_name: Optional[str] = None,
+    mysql_manager: Optional[MySQLMetadataManager] = None,
+    qdrant_manager: Optional[QdrantVectorManager] = None,
+) -> Dict[str, Any]:
+    """Wipe all data across both Qdrant vector database and MySQL metadata database.
+
+    Args:
+        collection_name: Target Qdrant collection name to wipe.
+        mysql_manager: Optional shared MySQL manager.
+        qdrant_manager: Optional shared Qdrant manager.
+
+    Returns:
+        Dictionary summarizing deleted records across both stores.
+    """
+    db_mgr = mysql_manager or MySQLMetadataManager()
+    qd_mgr = qdrant_manager or QdrantVectorManager(default_collection=collection_name)
+    target_col = collection_name or qd_mgr.collection_name
+
+    logger.warning(
+        f"Initiating full wipe across Qdrant collection '{target_col}' and "
+        "MySQL metadata store..."
+    )
+    with _logfire_span("storage.wipe_all", collection=target_col):
+        # 1. Wipe MySQL / SQLite relational store
+        mysql_stats = db_mgr.wipe_all_data()
+        # 2. Wipe Qdrant vector collection
+        qd_mgr.wipe_collection(collection_name=target_col)
+
+        logger.info(
+            f"Full storage wipe completed successfully: Qdrant collection '{target_col}' recreated, "
+            f"MySQL purged ({mysql_stats})."
+        )
+        return {
+            "status": "success",
+            "qdrant_collection_wiped": target_col,
+            "mysql_deleted": mysql_stats,
+        }
 
 
 # ==============================================================================
@@ -953,6 +1051,9 @@ def ingest_file(
 
 def ingest_directory(
     directory_path: Union[str, Path] = "DATA",
+    sub_dir: Optional[str] = None,
+    max_files: Optional[int] = None,
+    wipe: bool = False,
     recursive: bool = True,
     prefer_fallback: bool = False,
     collection_name: Optional[str] = None,
@@ -960,28 +1061,88 @@ def ingest_directory(
     mysql_manager: Optional[MySQLMetadataManager] = None,
     qdrant_manager: Optional[QdrantVectorManager] = None,
 ) -> DirectoryIngestionSummary:
-    """Recursively read documents in directory and ingest them into Qdrant & MySQL."""
-    dir_path = Path(directory_path).resolve()
+    """Recursively read documents in directory (or specific sub-directory) and ingest into Qdrant & MySQL.
+
+    Args:
+        directory_path: Root directory containing documents (default: DATA).
+        sub_dir: Optional specific subdirectory within directory_path (e.g. 'finetunes', 'noisy').
+                 When provided, only files in this targeted subdirectory are scanned and ingested.
+        max_files: Optional ceiling on the number of files to process.
+        wipe: If True, completely wipes all data in the target Qdrant collection and MySQL metadata
+              store before re-installing and ingesting the new set of data.
+        recursive: Whether to scan subdirectories recursively.
+        prefer_fallback: Whether to route embeddings to the fallback/fallout model.
+        collection_name: Target Qdrant collection override (defaults to settings.QDRANT_COLLECTION or 'dyxi_stag').
+        ignore_errors: Whether to continue processing remaining files if an individual file fails.
+        mysql_manager: Optional shared MySQL manager.
+        qdrant_manager: Optional shared Qdrant manager.
+
+    Returns:
+        DirectoryIngestionSummary summarizing counts of files, chunks, tables, formulas, and vectors.
+    """
+    base_dir = Path(directory_path).resolve()
+    if sub_dir:
+        target_dir = (base_dir / sub_dir).resolve()
+        if not target_dir.exists():
+            alt_path = Path(sub_dir).resolve()
+            if alt_path.exists():
+                target_dir = alt_path
+            else:
+                logger.warning(
+                    f"Subdirectory '{sub_dir}' not found at '{target_dir}'. Scanning target may be empty."
+                )
+    else:
+        target_dir = base_dir
+
     start_time = time.time()
     active_model = DEFAULT_FALLBACK_MODEL if prefer_fallback else DEFAULT_PRIMARY_MODEL
 
+    db_mgr = mysql_manager or MySQLMetadataManager()
+    qd_mgr = qdrant_manager or QdrantVectorManager(default_collection=collection_name)
+    active_col = collection_name or qd_mgr.collection_name
+
+    # 1. Execute Wipe if requested
+    if wipe:
+        logger.warning(
+            f"[WIPE TRIGGERED] Purging all points in Qdrant collection '{active_col}' "
+            "and all records in MySQL metadata tables..."
+        )
+        wipe_all_storage(
+            collection_name=active_col,
+            mysql_manager=db_mgr,
+            qdrant_manager=qd_mgr,
+        )
+
     logger.info(
-        f"Starting recursive directory ingestion on '{dir_path}' "
-        f"(recursive={recursive}, prefer_fallback={prefer_fallback}, model='{active_model}')..."
+        f"Starting directory ingestion on '{target_dir}' "
+        f"(sub_dir='{sub_dir or 'None'}', max_files={max_files or 'All'}, wipe={wipe}, "
+        f"recursive={recursive}, prefer_fallback={prefer_fallback}, model='{active_model}')..."
     )
 
     with _logfire_span(
         "ingest_directory",
-        directory=str(dir_path),
+        directory=str(target_dir),
+        sub_dir=str(sub_dir) if sub_dir else None,
+        max_files=max_files,
+        wipe=wipe,
         recursive=recursive,
         prefer_fallback=prefer_fallback,
         service_name=INGESTION_SERVICE_NAME,
     ):
-        files = scan_directory(dir_path, recursive=recursive)
+        files = scan_directory(target_dir, recursive=recursive) if target_dir.exists() else []
+        total_scanned = len(files)
+
+        # Apply max_files limit if set
+        if max_files is not None and max_files > 0 and len(files) > max_files:
+            logger.info(
+                f"Limiting ingestion to {max_files} file(s) out of {total_scanned} discovered in '{target_dir}'."
+            )
+            files = files[:max_files]
+
         if not files:
-            logger.warning(f"No supported document files found in directory: {dir_path}")
+            logger.warning(f"No supported document files found in directory: {target_dir}")
             return DirectoryIngestionSummary(
-                directory=str(dir_path),
+                directory=str(target_dir),
                 total_files_scanned=0,
                 successful_files=0,
                 failed_files=0,
@@ -994,14 +1155,11 @@ def ingest_directory(
                 duration_seconds=0.0,
             )
 
-        db_mgr = mysql_manager or MySQLMetadataManager()
-        qd_mgr = qdrant_manager or QdrantVectorManager(default_collection=collection_name)
-
         workflow = LangChainIngestionWorkflow(
             mysql_manager=db_mgr,
             qdrant_manager=qd_mgr,
             prefer_fallback=prefer_fallback,
-            collection_name=collection_name,
+            collection_name=active_col,
         )
 
         summaries: List[FileIngestionSummary] = []
@@ -1038,7 +1196,7 @@ def ingest_directory(
         )
 
         return DirectoryIngestionSummary(
-            directory=str(dir_path),
+            directory=str(target_dir),
             total_files_scanned=len(files),
             successful_files=len(summaries),
             failed_files=len(errors),
@@ -1346,8 +1504,29 @@ def main() -> None:
         "--collection",
         "-c",
         type=str,
-        default=getattr(settings, "QDRANT_COLLECTION", "dyxi_rag"),
-        help="Target Qdrant collection name",
+        default=getattr(settings, "QDRANT_COLLECTION", "dyxi_stag"),
+        help="Target Qdrant collection name (default: dyxi_stag)",
+    )
+    parser.add_argument(
+        "--wipe",
+        "-w",
+        action="store_true",
+        help="Wipe all existing data in Qdrant collection and MySQL before ingesting new data",
+    )
+    parser.add_argument(
+        "--sub-dir",
+        "--subdir",
+        "-s",
+        type=str,
+        default=None,
+        help="Target a specific subdirectory inside the data directory (e.g. 'finetunes', 'noisy')",
+    )
+    parser.add_argument(
+        "--max-files",
+        "-m",
+        type=int,
+        default=None,
+        help="Maximum number of files to process",
     )
     parser.add_argument(
         "--fallout",
@@ -1370,6 +1549,8 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.file:
+        if args.wipe:
+            wipe_all_storage(collection_name=args.collection)
         res = ingest_file(
             file_path=args.file,
             prefer_fallback=args.fallout,
@@ -1380,6 +1561,9 @@ def main() -> None:
     else:
         summary = ingest_directory(
             directory_path=args.data_dir,
+            sub_dir=args.sub_dir,
+            max_files=args.max_files,
+            wipe=args.wipe,
             recursive=not args.non_recursive,
             prefer_fallback=args.fallout,
             collection_name=args.collection,

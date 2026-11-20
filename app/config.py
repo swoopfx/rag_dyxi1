@@ -13,7 +13,7 @@ class Settings:
     # --- Qdrant Vector DB Settings ---
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
     QDRANT_CLUSTER_ENDPOINT = os.getenv("QDRANT_CLUSTER_ENDPOINT")
-    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dyxi_rag")
+    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "dyxi_stag")
 
     # --- MySQL Relational DB Settings (for nontextual tables/images) ---
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
