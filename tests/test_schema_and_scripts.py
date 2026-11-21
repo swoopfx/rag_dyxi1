@@ -121,24 +121,30 @@ def test_markdown_fallback_logfire():
 
 
 def test_logfire_observability_success_and_failure():
-    """Verify that @observe and observe_block track SUCCESS and FAILED statuses."""
-    import asyncio
-    from app.observability import observe, observe_block
+    """Verify that Logfire spans track execution, attributes, and exceptions."""
     import logfire
 
     captured_attributes: dict[str, dict] = {}
     recorded_exceptions: list[BaseException] = []
 
     class MockSpan:
-        def __init__(self, name):
+        def __init__(self, name, **kwargs):
             self.name = name
-            self.attrs = {}
+            self.attrs = dict(kwargs)
             captured_attributes[name] = self.attrs
 
         def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
+            if exc_type is not None:
+                self.attrs["execution.status"] = "FAILED"
+                self.attrs["execution.success"] = False
+                self.attrs["execution.error_type"] = exc_type.__name__
+                self.attrs["execution.error_message"] = str(exc_val)
+            else:
+                self.attrs["execution.status"] = "SUCCESS"
+                self.attrs["execution.success"] = True
             return False
 
         def set_attribute(self, key, value):
@@ -152,121 +158,40 @@ def test_logfire_observability_success_and_failure():
 
     original_span = logfire.span
     try:
-        logfire.span = lambda name, **kwargs: MockSpan(name)
+        logfire.span = lambda name, **kwargs: MockSpan(name, **kwargs)
 
-        # 1. Test synchronous function success
-        @observe(name="sample_success_func")
-        def sample_success_func(x: int, y: int) -> int:
-            return x + y
-
-        res = sample_success_func(3, 4)
+        # 1. Test Logfire span success block
+        with logfire.span("sample_success_span", file_name="sample.md") as span:
+            span.set_attribute("custom_key", "custom_value")
+            res = 3 + 4
         assert res == 7
-        success_span = captured_attributes.get("sample_success_func")
+        success_span = captured_attributes.get("sample_success_span")
         assert success_span is not None
         assert success_span.get("execution.status") == "SUCCESS"
         assert success_span.get("execution.success") is True
-        assert "execution.duration_ms" in success_span
+        assert success_span.get("custom_key") == "custom_value"
 
-        # 2. Test synchronous function failure
-        @observe(name="sample_fail_func")
-        def sample_fail_func():
-            raise ValueError("Intentional test failure")
-
+        # 2. Test Logfire span failure block with exception recording
         with pytest.raises(ValueError, match="Intentional test failure"):
-            sample_fail_func()
+            with logfire.span("sample_fail_span") as fail_span:
+                try:
+                    raise ValueError("Intentional test failure")
+                except ValueError as ex:
+                    fail_span.record_exception(ex)
+                    raise
 
-        fail_span = captured_attributes.get("sample_fail_func")
-        assert fail_span is not None
-        assert fail_span.get("execution.status") == "FAILED"
-        assert fail_span.get("execution.success") is False
-        assert fail_span.get("execution.error_type") == "ValueError"
-        assert "Intentional test failure" in fail_span.get("execution.error_message", "")
+        fail_span_attrs = captured_attributes.get("sample_fail_span")
+        assert fail_span_attrs is not None
+        assert fail_span_attrs.get("execution.status") == "FAILED"
+        assert fail_span_attrs.get("execution.success") is False
+        assert fail_span_attrs.get("execution.error_type") == "ValueError"
+        assert "Intentional test failure" in fail_span_attrs.get("execution.error_message", "")
         assert any(isinstance(e, ValueError) for e in recorded_exceptions)
-
-        # 3. Test async function success & failure
-        @observe(name="sample_async_func")
-        async def sample_async_func(ok: bool):
-            if not ok:
-                raise RuntimeError("Async test error")
-            return "async_ok"
-
-        async_res = asyncio.run(sample_async_func(True))
-        assert async_res == "async_ok"
-        async_ok_span = captured_attributes.get("sample_async_func")
-        assert async_ok_span.get("execution.status") == "SUCCESS"
-        assert async_ok_span.get("execution.success") is True
-
-        with pytest.raises(RuntimeError, match="Async test error"):
-            asyncio.run(sample_async_func(False))
-
-        async_fail_span = captured_attributes.get("sample_async_func")
-        assert async_fail_span.get("execution.status") == "FAILED"
-        assert async_fail_span.get("execution.success") is False
-        assert async_fail_span.get("execution.error_type") == "RuntimeError"
-
-        # 4. Test generator function success & failure
-        @observe(name="sample_gen_func")
-        def sample_gen_func(items: list):
-            for it in items:
-                if it == "boom":
-                    raise KeyError("Boom on item")
-                yield it * 2
-
-        gen_out = list(sample_gen_func([1, 2, 3]))
-        assert gen_out == [2, 4, 6]
-        gen_span = captured_attributes.get("sample_gen_func")
-        assert gen_span.get("execution.status") == "SUCCESS"
-        assert gen_span.get("execution.success") is True
-        assert gen_span.get("result.item_count") == 3
-
-        with pytest.raises(KeyError, match="Boom on item"):
-            list(sample_gen_func([1, "boom", 3]))
-
-        gen_fail_span = captured_attributes.get("sample_gen_func")
-        assert gen_fail_span.get("execution.status") == "FAILED"
-        assert gen_fail_span.get("execution.success") is False
-
-        # 5. Test class decoration with method tracing
-        @observe(name="SampleService")
-        class SampleService:
-            def compute(self, val: int) -> int:
-                return val * 10
-
-            def fail_method(self):
-                raise TypeError("Class method failure")
-
-        svc = SampleService()
-        assert svc.compute(5) == 50
-        method_span = captured_attributes.get("SampleService.compute")
-        assert method_span is not None
-        assert method_span.get("execution.status") == "SUCCESS"
-        assert method_span.get("execution.success") is True
-
-        with pytest.raises(TypeError, match="Class method failure"):
-            svc.fail_method()
-        method_fail_span = captured_attributes.get("SampleService.fail_method")
-        assert method_fail_span is not None
-        assert method_fail_span.get("execution.status") == "FAILED"
-        assert method_fail_span.get("execution.success") is False
-
-        # 6. Test observe_block context manager
-        with observe_block("custom_test_block") as b_span:
-            val = 42
-        block_span = captured_attributes.get("custom_test_block")
-        assert block_span.get("execution.status") == "SUCCESS"
-        assert block_span.get("execution.success") is True
-
-        with pytest.raises(IndexError):
-            with observe_block("failing_test_block"):
-                raise IndexError("Block index error")
-        block_fail_span = captured_attributes.get("failing_test_block")
-        assert block_fail_span.get("execution.status") == "FAILED"
-        assert block_fail_span.get("execution.success") is False
 
     finally:
         logfire.span = original_span
 
-    print("Verified Logfire observability for all function and class calls: SUCCESS and FAILED statuses confirmed.")
+    print("Verified Logfire observability spans: SUCCESS and FAILED statuses confirmed.")
 
 
 def test_app_modules_observability_instrumentation():

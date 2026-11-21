@@ -30,11 +30,16 @@ import datetime
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 import uuid
 
-from loguru import logger
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 from pydantic import BaseModel, Field
 
 # SQLAlchemy imports for MySQL
@@ -80,22 +85,64 @@ from app.services.retreival.embeddings import (
 # LOGFIRE OBSERVABILITY CONFIGURATION (INGESTION SERVICE)
 # ==============================================================================
 
-from app.observability import (
-    instrument_sqlalchemy_engine,
-    observe,
-    observe_block,
-    setup_observability,
-)
-
 # LangChain tracing suppression when API key is missing
 if not os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
-# Global Logfire setup
-setup_observability()
+INGESTION_SERVICE_NAME = getattr(
+    settings, "LOGFIRE_INGESTION_SERVICE_NAME", "rag-ingestion-service"
+)
 
-# Use observe_block as the unified span provider with SUCCESS/FAILED tracking
-_logfire_span = observe_block
+try:
+    import logfire
+
+    _logfire_token = getattr(settings, "LOGFIRE_TOKEN", None) or os.getenv("LOGFIRE_TOKEN")
+    logfire.configure(
+        send_to_logfire="if-token-present",
+        token=_logfire_token,
+        service_name=INGESTION_SERVICE_NAME,
+    )
+except Exception:
+    logfire = None
+
+
+class _NoopSpan:
+    """No-op span placeholder for when Logfire is unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        pass
+
+    def set_attributes(self, attributes: Dict[str, Any]) -> None:
+        pass
+
+    def record_exception(self, exception: BaseException) -> None:
+        pass
+
+
+_NOOP_SPAN = _NoopSpan()
+
+
+@contextlib.contextmanager
+def _logfire_span(name: str, **kwargs: Any):
+    """Context manager for Logfire distributed tracing and span telemetry."""
+    if logfire is not None:
+        try:
+            cm = logfire.span(name, **kwargs)
+        except Exception:
+            cm = None
+
+        if cm is not None:
+            with cm as span:
+                yield span
+            return
+
+    yield _NOOP_SPAN
 
 
 # ==============================================================================
@@ -196,7 +243,6 @@ class ExtractedFormulaRecord(Base):
 # ==============================================================================
 
 
-@observe()
 class MySQLMetadataManager:
     """Production manager for persisting complete, uncorrupted non-textual data in MySQL.
 
@@ -229,7 +275,11 @@ class MySQLMetadataManager:
                 conn.execute(sqlalchemy.text("SELECT 1"))
             self.engine = engine
             self.is_sqlite_fallback = False
-            instrument_sqlalchemy_engine(self.engine)
+            if logfire is not None:
+                try:
+                    logfire.instrument_sqlalchemy(self.engine)
+                except Exception:
+                    pass
             logger.info("Successfully connected to MySQL database.")
         except Exception as e:
             logger.warning(
@@ -238,7 +288,11 @@ class MySQLMetadataManager:
             )
             self.engine = create_engine(self.sqlite_url)
             self.is_sqlite_fallback = True
-            instrument_sqlalchemy_engine(self.engine)
+            if logfire is not None:
+                try:
+                    logfire.instrument_sqlalchemy(self.engine)
+                except Exception:
+                    pass
 
         # 2. Ensure schema tables exist
         try:
@@ -493,7 +547,6 @@ class VectorIndexEntry(BaseModel):
     payload: Dict[str, Any]
 
 
-@observe()
 class QdrantVectorManager:
     """Production manager for Qdrant vector database operations.
 
@@ -650,14 +703,18 @@ class QdrantVectorManager:
                     self.client.delete_collection(collection_name=col)
                 # Re-create empty collection with proper configuration
                 self.ensure_collection(collection_name=col, vector_size=vector_size, distance=distance)
-                logger.info(f"Successfully wiped and re-created empty Qdrant collection '{col}'.")
+                try:
+                    col_info = self.client.get_collection(collection_name=col)
+                    points_count = col_info.points_count or 0
+                except Exception:
+                    points_count = 0
+                logger.info(f"Successfully wiped and re-created empty Qdrant collection '{col}' (points: {points_count}).")
                 return True
             except Exception as e:
                 logger.error(f"Failed to wipe/recreate Qdrant collection '{col}': {e}")
                 raise
 
 
-@observe()
 def wipe_all_storage(
     collection_name: Optional[str] = None,
     mysql_manager: Optional[MySQLMetadataManager] = None,
@@ -687,13 +744,20 @@ def wipe_all_storage(
         # 2. Wipe Qdrant vector collection
         qd_mgr.wipe_collection(collection_name=target_col)
 
+        try:
+            col_info = qd_mgr.client.get_collection(collection_name=target_col)
+            qdrant_points = col_info.points_count or 0
+        except Exception:
+            qdrant_points = 0
+
         logger.info(
-            f"Full storage wipe completed successfully: Qdrant collection '{target_col}' recreated, "
+            f"Full storage wipe completed successfully: Qdrant collection '{target_col}' recreated (points: {qdrant_points}), "
             f"MySQL purged ({mysql_stats})."
         )
         return {
             "status": "success",
             "qdrant_collection_wiped": target_col,
+            "qdrant_points_remaining": qdrant_points,
             "mysql_deleted": mysql_stats,
         }
 
@@ -753,7 +817,6 @@ class DirectoryIngestionSummary(BaseModel):
 # ==============================================================================
 
 
-@observe()
 class LangChainIngestionWorkflow:
     """Production LangChain LCEL workflow for Summary-Indexed document ingestion.
 
@@ -1059,7 +1122,6 @@ class LangChainIngestionWorkflow:
 # ==============================================================================
 
 
-@observe()
 def ingest_file(
     file_path: Union[str, Path],
     prefer_fallback: bool = False,
@@ -1077,7 +1139,6 @@ def ingest_file(
     return workflow.invoke(file_path)
 
 
-@observe()
 def ingest_directory(
     directory_path: Union[str, Path] = "DATA",
     sub_dir: Optional[str] = None,
@@ -1288,7 +1349,6 @@ def ingest_directory(
 # ==============================================================================
 
 
-@observe()
 def retrieve_similar_chunks(
     query: str,
     top_k: int = 5,
@@ -1583,7 +1643,12 @@ def main() -> None:
         "--wipe",
         "-w",
         action="store_true",
-        help="Wipe all existing data in Qdrant collection and MySQL before ingesting new data",
+        help="Wipe all existing data in Qdrant collection and MySQL (wipes only if no file/data-dir is explicitly specified, or wipes before ingesting)",
+    )
+    parser.add_argument(
+        "--wipe-only",
+        action="store_true",
+        help="Wipe all existing data in Qdrant collection and MySQL without performing any document ingestion",
     )
     parser.add_argument(
         "--sub-dir",
@@ -1620,7 +1685,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.file:
+    # Determine if this invocation is a dedicated wipe-only operation
+    explicit_data_dir = any(arg in sys.argv for arg in ("--data-dir", "-d"))
+    wipe_only = args.wipe_only or (args.wipe and not args.file and not explicit_data_dir)
+
+    if wipe_only:
+        wipe_result = wipe_all_storage(collection_name=args.collection)
+        print("\n--- STORAGE WIPE SUMMARY ---")
+        print(json.dumps(wipe_result, indent=2))
+        if not args.query:
+            return
+    elif args.file:
         if args.wipe:
             wipe_all_storage(collection_name=args.collection)
         res = ingest_file(

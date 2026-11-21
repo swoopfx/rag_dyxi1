@@ -16,7 +16,11 @@ import re
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Union
 
 import pandas as pd
-from loguru import logger
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -45,10 +49,57 @@ from docling_core.types.doc import (
     TextItem,
 )
 
-# Observability
-from app.observability import observe, observe_block
+# Logfire Observability Setup
+try:
+    import logfire
 
-_logfire_span = observe_block
+    _logfire_token = getattr(settings, "LOGFIRE_TOKEN", None) or os.getenv("LOGFIRE_TOKEN")
+    logfire.configure(
+        send_to_logfire="if-token-present",
+        token=_logfire_token,
+        service_name="rag-loader-service",
+    )
+except Exception:
+    logfire = None
+
+
+class _NoopSpan:
+    """No-op span placeholder for when Logfire is unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        pass
+
+    def set_attributes(self, attributes: Dict[str, Any]) -> None:
+        pass
+
+    def record_exception(self, exception: BaseException) -> None:
+        pass
+
+
+_NOOP_SPAN = _NoopSpan()
+
+
+@contextlib.contextmanager
+def _logfire_span(name: str, **kwargs: Any):
+    """Context manager for Logfire distributed tracing and span telemetry."""
+    if logfire is not None:
+        try:
+            cm = logfire.span(name, **kwargs)
+        except Exception:
+            cm = None
+
+        if cm is not None:
+            with cm as span:
+                yield span
+            return
+
+    yield _NOOP_SPAN
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg",
@@ -112,7 +163,6 @@ class BoundingBox(BaseModel):
 # ==============================================================================
 
 
-@observe()
 def describe_image_with_gemini(
     image: Union[Image.Image, bytes, bytearray, str, Path],
     model: Optional[str] = None,
@@ -203,7 +253,6 @@ def describe_image_with_gemini(
     return ""
 
 
-@observe()
 class ExtractedImage(BaseModel):
     """Extracted image or visual element (figure, chart, picture, diagram)."""
 
@@ -287,7 +336,6 @@ class ExtractedImage(BaseModel):
         raise ValueError("Cannot save image: PIL Image instance is None")
 
 
-@observe()
 class ExtractedTable(BaseModel):
     """Extracted structured table from the document."""
 
@@ -359,7 +407,6 @@ class ExtractedTable(BaseModel):
         return summary_val
 
 
-@observe()
 class ExtractedFormula(BaseModel):
     """Extracted mathematical formula or equation formatted in LaTeX."""
 
@@ -410,7 +457,6 @@ class DocumentElement(BaseModel):
         default_factory=dict, description="Additional item metadata")
 
 
-@observe()
 class MultimodalDocument(BaseModel):
     """Comprehensive container for a multi-modal document extracted with Docling."""
 
@@ -532,7 +578,6 @@ class MultimodalDocument(BaseModel):
 # ==============================================================================
 
 
-@observe()
 def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     """Convert a PIL Image to a Base64 Data URI string."""
     buffer = io.BytesIO()
@@ -545,7 +590,6 @@ def image_to_base64(image: Image.Image, format: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{encoded}"
 
 
-@observe()
 def _extract_bbox_from_prov(item: Any) -> tuple[Optional[int], Optional[BoundingBox]]:
     """Extract page number and bounding box coordinates from item provenance."""
     page_no: Optional[int] = None
@@ -566,7 +610,6 @@ def _extract_bbox_from_prov(item: Any) -> tuple[Optional[int], Optional[Bounding
     return page_no, bbox
 
 
-@observe()
 def build_docling_converter(
     do_ocr: bool = True,
     do_table_structure: bool = True,
@@ -592,7 +635,6 @@ def build_docling_converter(
     return DocumentConverter(format_options=format_options)
 
 
-@observe()
 def _load_markdown_fallback(
     path: Path,
     file_name: str,
@@ -705,7 +747,6 @@ def _load_markdown_fallback(
 # ==============================================================================
 
 
-@observe()
 def load_file(
     file_path: Union[str, Path],
     extract_images: bool = True,
@@ -1199,7 +1240,6 @@ load_multimodal_document = load_file
 # ==============================================================================
 
 
-@observe()
 def scan_directory(
     directory_path: Union[str, Path],
     recursive: bool = True,
@@ -1237,7 +1277,6 @@ def scan_directory(
     return matched_files
 
 
-@observe()
 def load_directory(
     directory_path: Union[str, Path],
     recursive: bool = True,
